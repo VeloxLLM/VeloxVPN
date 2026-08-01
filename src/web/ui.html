@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VeloxVPN</title>
+<style>
+  :root {
+    --bg: #1c1f26; --bg2: #23272f; --bg3: #2a2f3a;
+    --fg: #d7dbe2; --muted: #8b93a5; --accent: #4f9cf9; --green: #3ecf8e; --red: #f46d6d;
+    --border: #363c49; --term: #0e1116;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--fg); font-family: "Segoe UI", -apple-system, sans-serif; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 14px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+  header .logo { font-weight: 700; font-size: 14px; color: var(--accent); }
+  nav { display: flex; gap: 4px; }
+  nav button { background: none; border: none; color: var(--muted); padding: 6px 14px; cursor: pointer; border-radius: 4px; font-size: 13px; }
+  nav button.active { background: var(--bg3); color: var(--fg); }
+  header .spacer { flex: 1; }
+  header input[type=password] { background: var(--bg3); border: 1px solid var(--border); color: var(--fg); padding: 5px 8px; border-radius: 4px; width: 180px; }
+  main { flex: 1; display: flex; overflow: hidden; }
+  .hidden { display: none !important; }
+
+  /* Subscription tab */
+  #subTab { flex: 1; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .card h3 { margin-bottom: 8px; font-size: 13px; }
+  .url-box { display: flex; gap: 8px; align-items: center; }
+  .url-box input { flex: 1; background: var(--term); border: 1px solid var(--border); color: var(--green); padding: 8px; border-radius: 4px; font-family: monospace; }
+  pre.sub { background: var(--term); border: 1px solid var(--border); padding: 12px; border-radius: 6px; overflow: auto; flex: 1; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; color: var(--fg); }
+  button { background: var(--accent); color: #fff; border: none; padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); }
+  button.danger { background: var(--red); }
+
+  /* Admin tab */
+  #adminTab { flex: 1; display: flex; }
+  aside { width: 220px; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  aside .tree { flex: 1; overflow: auto; padding: 8px 0; }
+  aside .tree .item { padding: 7px 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; border-left: 2px solid transparent; }
+  aside .tree .item:hover { background: var(--bg3); }
+  aside .tree .item.active { background: var(--bg3); border-left-color: var(--accent); }
+  aside .tree .item .del { color: var(--muted); cursor: pointer; padding: 0 4px; }
+  aside .tree .item .del:hover { color: var(--red); }
+  aside .add { padding: 10px; border-top: 1px solid var(--border); }
+  aside .add button { width: 100%; }
+  section { flex: 1; overflow: auto; padding: 16px; }
+  form { display: grid; grid-template-columns: 140px 1fr; gap: 10px 12px; max-width: 620px; }
+  form label { color: var(--muted); align-self: center; }
+  form input, form select { background: var(--bg3); border: 1px solid var(--border); color: var(--fg); padding: 7px 9px; border-radius: 4px; }
+  form .actions { grid-column: 1 / -1; display: flex; gap: 8px; margin-top: 6px; }
+
+  /* Bottom terminal */
+  footer { background: var(--term); border-top: 1px solid var(--border); height: 140px; display: flex; flex-direction: column; }
+  footer .bar { display: flex; justify-content: space-between; padding: 4px 10px; color: var(--muted); border-bottom: 1px solid var(--border); font-size: 12px; }
+  footer pre { flex: 1; overflow: auto; padding: 8px 10px; font-family: monospace; font-size: 12px; color: var(--green); }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">VeloxVPN</span>
+  <nav>
+    <button id="navSub" class="active" onclick="showTab('sub')">Subscription</button>
+    <button id="navAdmin" onclick="showTab('admin')">Admin</button>
+  </nav>
+  <div class="spacer"></div>
+  <input type="password" id="adminToken" placeholder="Admin token" onchange="saveToken()">
+</header>
+<main>
+  <div id="subTab">
+    <div class="card">
+      <h3>Subscription URL / 订阅地址</h3>
+      <div class="url-box">
+        <input id="subUrl" readonly>
+        <button class="ghost" onclick="copyUrl()">Copy</button>
+        <button onclick="regenerate()">Regenerate</button>
+      </div>
+    </div>
+    <pre class="sub" id="subText">loading...</pre>
+  </div>
+  <div id="adminTab" class="hidden">
+    <aside>
+      <div class="tree" id="nodeTree"></div>
+      <div class="add"><button onclick="newNode()">+ New node</button></div>
+    </aside>
+    <section>
+      <div id="emptyHint" class="card">Select a node from the left to edit, or create a new one.</div>
+      <form id="nodeForm" class="hidden">
+        <label>Name</label><input id="fName">
+        <label>Type</label><select id="fType"><option>vless</option><option>anytls</option><option>hysteria2</option></select>
+        <label>Listen</label><input id="fListen" value="0.0.0.0">
+        <label>Port (0 = random)</label><input id="fPort" type="number" value="0">
+        <label>UUID (vless)</label><input id="fUuid">
+        <label>Password</label><input id="fPassword">
+        <label>Network (vless)</label><input id="fNetwork" value="ws" placeholder="tcp / ws">
+        <label>Host / SNI</label><input id="fHost" value="www.cloudflare.com">
+        <label>WS path</label><input id="fPath" placeholder="/ws">
+        <label>Via</label><input id="fVia" placeholder="cf-quick-tunnel">
+        <label>Obfs (hy2)</label><input id="fObfs" placeholder="salamander">
+        <label>ALPN</label><input id="fAlpn" value="h2,http/1.1" placeholder="h2,http/1.1">
+        <label>Server (public addr)</label><input id="fServer" placeholder="e.g. xxx.trycloudflare.com">
+        <div class="actions">
+          <button type="button" onclick="saveNode()">Save</button>
+          <button type="button" class="danger" onclick="deleteNode()">Delete</button>
+        </div>
+      </form>
+    </section>
+  </div>
+</main>
+<footer>
+  <div class="bar"><span id="statusText">connecting...</span><span>VeloxVPN</span></div>
+  <pre id="term"></pre>
+</footer>
+<script>
+let nodes = [];
+let current = null;
+const TOKEN_KEY = "veloxvpn_admin_token";
+
+function token() { return document.getElementById("adminToken").value || localStorage.getItem(TOKEN_KEY) || ""; }
+function saveToken() { localStorage.setItem(TOKEN_KEY, token()); }
+window.addEventListener("DOMContentLoaded", () => {
+  const saved = localStorage.getItem(TOKEN_KEY);
+  if (saved) document.getElementById("adminToken").value = saved;
+  loadStatus();
+  setInterval(loadStatus, 3000);
+});
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (token()) headers["X-Admin-Token"] = token();
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) throw new Error("unauthorized: check admin token");
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+function showTab(t) {
+  document.getElementById("navSub").classList.toggle("active", t === "sub");
+  document.getElementById("navAdmin").classList.toggle("active", t === "admin");
+  document.getElementById("subTab").classList.toggle("hidden", t !== "sub");
+  document.getElementById("adminTab").classList.toggle("hidden", t !== "admin");
+  if (t === "admin") loadNodes();
+}
+
+async function loadStatus() {
+  try {
+    const s = await api("/api/status");
+    const sub = s.subscription;
+    const base = sub.url.base;
+    document.getElementById("subUrl").value = base + sub.path + "?token=" + sub.token;
+    const rows = s.nodes.map(n => n.name + "  [" + n.type + "]  " + (n.addr || (n.port)) + "  via:" + (n.via || "-")).join("\n");
+    document.getElementById("statusText").textContent = "nodes: " + s.nodes.length + " | " + rows.split("\n")[0] || "running";
+    document.getElementById("term").textContent = rows || "no inbounds";
+    return s;
+  } catch (e) {
+    document.getElementById("statusText").textContent = "error: " + e.message;
+  }
+}
+
+async function loadSubText() {
+  try {
+    const r = await fetch("/api/subscription", { headers: token() ? { "X-Admin-Token": token() } : {} });
+    document.getElementById("subText").textContent = await r.text();
+  } catch (e) { document.getElementById("subText").textContent = "error: " + e.message; }
+}
+
+async function copyUrl() {
+  const v = document.getElementById("subUrl").value;
+  await navigator.clipboard.writeText(v);
+  const b = document.querySelector("#subTab .card button");
+  b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1200);
+}
+
+async function regenerate() {
+  try {
+    const r = await api("/api/subscription/regenerate", { method: "POST" });
+    await loadStatus(); await loadSubText();
+  } catch (e) { alert(e.message); }
+}
+
+async function loadNodes() {
+  try {
+    const d = await api("/api/nodes");
+    nodes = d.nodes;
+    const tree = document.getElementById("nodeTree");
+    tree.innerHTML = "";
+    nodes.forEach(n => {
+      const div = document.createElement("div");
+      div.className = "item";
+      const left = document.createElement("span");
+      left.textContent = n.name + " (" + n.type + ")";
+      left.onclick = () => select(n.name);
+      const del = document.createElement("span");
+      del.className = "del"; del.textContent = "✕";
+      del.onclick = (e) => { e.stopPropagation(); remove(n.name); };
+      div.appendChild(left); div.appendChild(del);
+      tree.appendChild(div);
+    });
+  } catch (e) { alert(e.message); }
+}
+
+function select(name) {
+  const n = nodes.find(x => x.name === name);
+  if (!n) return;
+  current = n.name;
+  document.querySelectorAll("#nodeTree .item").forEach(x => x.classList.remove("active"));
+  document.getElementById("nodeForm").classList.remove("hidden");
+  document.getElementById("emptyHint").classList.add("hidden");
+  document.getElementById("fName").value = n.name || "";
+  document.getElementById("fType").value = n.type || "vless";
+  document.getElementById("fListen").value = n.listen || "0.0.0.0";
+  document.getElementById("fPort").value = n.port || 0;
+  document.getElementById("fUuid").value = n.uuid || "";
+  document.getElementById("fPassword").value = n.password || "";
+  document.getElementById("fNetwork").value = n.network || "ws";
+  document.getElementById("fHost").value = n.host || "www.cloudflare.com";
+  document.getElementById("fPath").value = n.path || "";
+  document.getElementById("fVia").value = n.via || "";
+  document.getElementById("fObfs").value = n.obfs || "";
+  document.getElementById("fAlpn").value = (n.alpn || []).join(",");
+  document.getElementById("fServer").value = n.addr ? "" : (n.server || "");
+}
+
+function newNode() {
+  current = null;
+  document.getElementById("nodeForm").classList.remove("hidden");
+  document.getElementById("emptyHint").classList.add("hidden");
+  ["fName","fUuid","fPassword","fPath","fVia","fObfs","fServer"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("fType").value = "vless";
+  document.getElementById("fListen").value = "0.0.0.0";
+  document.getElementById("fPort").value = "0";
+  document.getElementById("fNetwork").value = "ws";
+  document.getElementById("fHost").value = "www.cloudflare.com";
+  document.getElementById("fAlpn").value = "h2,http/1.1";
+}
+
+function readForm() {
+  const body = {
+    name: document.getElementById("fName").value,
+    type: document.getElementById("fType").value,
+    listen: document.getElementById("fListen").value,
+    port: parseInt(document.getElementById("fPort").value || "0"),
+    uuid: document.getElementById("fUuid").value || null,
+    password: document.getElementById("fPassword").value || null,
+    network: document.getElementById("fNetwork").value || null,
+    host: document.getElementById("fHost").value || null,
+    path: document.getElementById("fPath").value || null,
+    via: document.getElementById("fVia").value || null,
+    obfs: document.getElementById("fObfs").value || null,
+    sni: document.getElementById("fHost").value || null,
+    alpn: document.getElementById("fAlpn").value.split(",").filter(Boolean),
+    server: document.getElementById("fServer").value || null
+  };
+  return body;
+}
+
+async function saveNode() {
+  const body = readForm();
+  try {
+    if (current) await api("/api/nodes/" + encodeURIComponent(current), { method: "PUT", body: JSON.stringify(body) });
+    else await api("/api/nodes", { method: "POST", body: JSON.stringify(body) });
+    await loadNodes(); await loadStatus();
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteNode() {
+  if (!current) return;
+  if (!confirm("Delete node " + current + "?")) return;
+  try {
+    await api("/api/nodes/" + encodeURIComponent(current), { method: "DELETE" });
+    current = null;
+    document.getElementById("nodeForm").classList.add("hidden");
+    await loadNodes(); await loadStatus();
+  } catch (e) { alert(e.message); }
+}
+
+async function remove(name) {
+  if (!confirm("Delete node " + name + "?")) return;
+  try {
+    await api("/api/nodes/" + encodeURIComponent(name), { method: "DELETE" });
+    if (current === name) current = null;
+    await loadNodes(); await loadStatus();
+  } catch (e) { alert(e.message); }
+}
+
+loadSubText();
+</script>
+</body>
+</html>
