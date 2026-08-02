@@ -94,19 +94,26 @@ pub fn build_uri(inb: &InboundConfig) -> Option<String> {
             let uuid = inb.uuid.as_ref()?;
             let (host, port) = public_host(inb, 443);
             let network = inb.network.as_deref().unwrap_or("tcp");
-            let ws_host = inb.host.as_deref().unwrap_or("www.cloudflare.com");
+            let via_cf = inb.via.as_deref() == Some("cf-quick-tunnel");
+            // When published through a Cloudflare quick tunnel, the ws Host header
+            // must be the tunnel hostname and TLS terminates at the CF edge.
+            let ws_host = if via_cf {
+                host.clone()
+            } else {
+                inb.host.as_deref().unwrap_or("www.cloudflare.com").to_string()
+            };
             let path = inb.path.as_deref().unwrap_or("/");
             if network == "ws" {
+                let security = if via_cf { "tls" } else { "none" };
                 Some(format!(
-                    "vless://{uuid}@{host}:{port}?encryption=none&security=tls&type=ws&host={}&path={}#{}",
-                    urlencoding::encode(ws_host),
+                    "vless://{uuid}@{host}:{port}?encryption=none&security={security}&type=ws&host={}&path={}#{}",
+                    urlencoding::encode(&ws_host),
                     urlencoding::encode(path),
                     urlencoding::encode(name)
                 ))
             } else {
                 Some(format!(
-                    "vless://{uuid}@{host}:{port}?encryption=none&security=reality&sni={}#{}",
-                    urlencoding::encode(ws_host),
+                    "vless://{uuid}@{host}:{port}?encryption=none&security=none#{}",
                     urlencoding::encode(name)
                 ))
             }
@@ -148,13 +155,94 @@ pub fn build_uri(inb: &InboundConfig) -> Option<String> {
     }
 }
 
-/// Build the full subscription text (one URI per line).
+fn yaml_escape(s: &str) -> String {
+    if s.contains(':') || s.contains('#') || s.contains(' ') {
+        format!("\"{}\"", s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Build the full raw subscription text (one URI per line).
 pub fn build_subscription(inbounds: &[InboundConfig]) -> String {
     inbounds
         .iter()
         .filter_map(build_uri)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Build a Clash / Mihomo compatible subscription (proxies + proxy-groups + rules).
+pub fn build_clash_subscription(inbounds: &[InboundConfig]) -> String {
+    let mut out = String::from("proxies:\n");
+    for inb in inbounds {
+        match inb.typ {
+            Protocol::Vless => {
+                let Some(uuid) = inb.uuid.as_ref() else { continue };
+                let (host, port) = public_host(inb, 443);
+                let via_cf = inb.via.as_deref() == Some("cf-quick-tunnel");
+                let ws_host = if via_cf {
+                    host.clone()
+                } else {
+                    inb.host.as_deref().unwrap_or("www.cloudflare.com").to_string()
+                };
+                let path = inb.path.as_deref().unwrap_or("/");
+                out.push_str(&format!(
+                    "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: ws\n    tls: {}\n    udp: true\n    servername: {}\n    client-fingerprint: chrome\n    ws-opts:\n      path: {}\n      headers:\n        Host: {}\n",
+                    yaml_escape(&inb.name),
+                    host,
+                    port,
+                    uuid,
+                    if via_cf { "true" } else { "false" },
+                    ws_host,
+                    yaml_escape(path),
+                    yaml_escape(&ws_host),
+                ));
+            }
+            Protocol::AnyTls => {
+                let Some(password) = inb.password.as_ref() else { continue };
+                let (host, port) = public_host(inb, 443);
+                let sni = inb.sni.as_deref().unwrap_or("www.cloudflare.com");
+                let default_alpn: Vec<String> = vec!["h2".into(), "http/1.1".into()];
+                let alpn = inb.alpn.as_deref().unwrap_or(&default_alpn);
+                let alpn_str: Vec<String> = alpn.iter().map(|a| format!("  - \"{}\"", a)).collect();
+                out.push_str(&format!(
+                    "  - name: {}\n    type: anytls\n    server: {}\n    port: {}\n    password: {}\n    tls: true\n    udp: true\n    servername: {}\n    alpn:\n{}\n    skip-cert-verify: true\n",
+                    yaml_escape(&inb.name),
+                    host,
+                    port,
+                    yaml_escape(password),
+                    sni,
+                    alpn_str.join("\n"),
+                ));
+            }
+            Protocol::Tuic => {
+                let Some(uuid) = inb.uuid.as_ref() else { continue };
+                let password = inb.password.as_deref().unwrap_or("");
+                let (host, port) = public_host(inb, 443);
+                let sni = inb.sni.as_deref().unwrap_or("www.cloudflare.com");
+                out.push_str(&format!(
+                    "  - name: {}\n    type: tuic\n    server: {}\n    port: {}\n    uuid: {}\n    password: {}\n    alpn:\n      - \"h3\"\n    congestion-controller: bbr\n    servername: {}\n    udp: true\n    skip-cert-verify: true\n",
+                    yaml_escape(&inb.name),
+                    host,
+                    port,
+                    uuid,
+                    yaml_escape(password),
+                    sni,
+                ));
+            }
+        }
+    }
+
+    let names: Vec<String> = inbounds.iter().map(|i| format!("      - {}", yaml_escape(&i.name))).collect();
+    out.push_str(&format!(
+        "proxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n{}\n      - DIRECT\n",
+        names.join("\n"),
+    ));
+    out.push_str(
+        "rules:\n  - GEOIP,CN,DIRECT\n  - MATCH,PROXY\n",
+    );
+    out
 }
 
 /// Build connection parameters for an outbound, used by protocol clients.

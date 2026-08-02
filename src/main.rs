@@ -44,22 +44,25 @@ async fn main() {
         identity,
         handles: Arc::new(Mutex::new(Default::default())),
         addrs: Arc::new(Mutex::new(Default::default())),
+        tunnels: Arc::new(Mutex::new(Default::default())),
     });
 
     web::spawn_all(&state).await;
 
-    let (listen, sub_path, sub_token, admin_token) = {
+    let (listen, sub_path, sub_token, admin_token, user) = {
         let cfg = state.config.read().await;
         (
             cfg.web.listen.clone(),
             cfg.subscription.path.clone(),
             cfg.subscription.token.clone(),
             cfg.web.admin_token.clone(),
+            cfg.web.user.clone(),
         )
     };
 
-    tracing::info!("admin token: {admin_token}");
-    tracing::info!("web UI:      http://{listen}");
+    tracing::info!("web UI:       http://{listen}");
+    tracing::info!("login:        {user} / <configured password>");
+    tracing::info!("admin token:  {admin_token}");
     tracing::info!("subscription: http://{listen}{sub_path}?token={sub_token}");
 
     let listener = match tokio::net::TcpListener::bind(&listen).await {

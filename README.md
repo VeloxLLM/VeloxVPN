@@ -9,7 +9,8 @@
 ## Features / 特性
 
 - **Only 3 protocols** — VLESS, AnyTLS, TUIC. No extra bloat. / 只支持 VLESS、AnyTLS、TUIC 三种协议，没有多余功能。
-- **Simple local Web UI** — a browser-based panel (similar to a Cloud9-style web terminal) with two modules: **Subscription URL** and **Admin**. / 简洁的本地 Web 管理界面，类似 Cloud9 风格的 Web 面板，包含两个模块：**订阅地址** 与 **管理后台**。
+- **Simple local Web UI** — a browser-based panel (similar to a Cloud9-style web terminal) with two modules: **Subscription URL** and **Admin**, protected by a login (default `admin` / `admin1234`, changeable). / 简洁的本地 Web 管理界面，类似 Cloud9 风格的 Web 面板，包含**订阅地址**与**管理后台**两个模块，带登录保护（默认 `admin` / `admin1234`，可修改）。
+- **Subscription in two formats** — raw `vless://`/`anytls://`/`tuic://` URIs and a ready-to-use **Clash / Mihomo** YAML (proxies + rules). / 订阅支持两种格式：原始链接和可直接导入的 **Clash / Mihomo** YAML（含节点与规则）。
 - **Rust & async** — high performance, low memory footprint, memory-safe. / 基于 Rust 异步运行时，性能高、内存占用低、内存安全。
 - **Random ports** — every inbound gets a randomly generated port **once at first startup, then fixed** (persisted in config). / 全部入站使用**随机端口**，**首次启动时生成一次，此后保持不变**（持久化到配置）。
 - **Anti-blocking** — VLESS over **WS + Host header**, configurable **SNI / ALPN** for TLS/QUIC camouflage. / **抗封锁**：VLESS 走 **WS + Host 头**，可配置 **SNI / ALPN** 伪装。
@@ -77,11 +78,14 @@ cargo build --release
 ./target/release/veloxvpn --config config.json
 ```
 
-Then open the web UI in your browser: / 然后在浏览器打开 Web 界面：
+Then open the web UI in your browser and log in: / 然后在浏览器打开 Web 界面并登录：
 
 ```
-http://127.0.0.1:8080
+http://127.0.0.1:8080        # default login: admin / admin1234
 ```
+
+- Default login is **`admin` / `admin1234`**; you can change the username & password after logging in (Admin → Account). / 默认账号 **`admin` / `admin1234`**，登录后可在「管理后台 → 账号」修改用户名和密码。
+- If `cloudflared` is installed, a VLESS inbound with `via: "cf-quick-tunnel"` automatically opens a quick tunnel and its public `*.trycloudflare.com` hostname is written into the subscription. / 若本机装有 `cloudflared`，`via: "cf-quick-tunnel"` 的 VLESS 入站会自动开启快速隧道，并把 `*.trycloudflare.com` 公网域名写入订阅。
 
 ## Configuration / 配置
 
@@ -91,7 +95,9 @@ Create a `config.json` like this: / 配置示例 `config.json`：
 {
   "web": {
     "listen": "127.0.0.1:8080",
-    "admin_token": "your-admin-password"
+    "admin_token": "your-admin-token",
+    "user": "admin",
+    "password": "admin1234"
   },
   "subscription": {
     "enabled": true,
@@ -168,8 +174,12 @@ VeloxVPN serves a minimal web panel on the address you configure (default `127.0
 ### 1. Subscription URL / 订阅地址
 
 - Provides a single subscription URL for clients to import all inbound nodes at once. / 提供给客户端一个统一的订阅地址，一键导入全部入站节点。
+- Two formats, switchable in the UI / 两种格式，可在界面切换：
+  - **Raw URIs** — plain `vless://` / `anytls://` / `tuic://` links (sing-box, v2rayN). / 原始链接，适合 sing-box / v2rayN。
+  - **Clash / Mihomo** — a ready-to-use YAML with `proxies`, a `PROXY` select group and default rules (`GEOIP,CN,DIRECT` + `MATCH,PROXY`). Clash needs rules to route traffic through the proxy, so they are included. / 可直接导入 Clash/Mihomo 的 YAML，含 `proxies`、`PROXY` 选择组和默认规则（`GEOIP,CN,DIRECT` + `MATCH,PROXY`）。Clash 依赖规则路由流量到代理，因此内置规则。
 - The subscription path/token is **randomly generated** when first started. / 订阅地址在首次启动时**随机生成**。
 - The admin can **regenerate** the subscription URL at any time (old one becomes invalid). / 管理后台可随时**重新生成**订阅地址（旧地址随即失效）。
+- URL param `?format=clash` returns the Clash YAML; default (no param) returns raw URIs. / 加 `?format=clash` 返回 Clash YAML，默认返回原始链接。
 
 ### 2. Admin / 管理后台
 

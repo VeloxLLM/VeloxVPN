@@ -25,6 +25,7 @@ pub struct AppState {
     pub identity: TlsIdentity,
     pub handles: Arc<Mutex<HashMap<String, JoinHandle<Result<(), String>>>>>,
     pub addrs: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    pub tunnels: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -50,11 +51,83 @@ pub async fn spawn_all(state: &SharedState) {
                     addr,
                     inb.via.as_deref().unwrap_or("-")
                 );
+                if inb.typ == crate::config::Protocol::Vless
+                    && inb.via.as_deref() == Some("cf-quick-tunnel")
+                {
+                    start_cloudflared(state, inb).await;
+                }
             }
             Err(e) => {
                 tracing::error!("failed to start inbound {}: {e}", inb.name);
             }
         }
+    }
+}
+
+/// Spawn a `cloudflared` quick tunnel for a local inbound and, once ready,
+/// persist the random `*.trycloudflare.com` hostname as the public server.
+async fn start_cloudflared(state: &SharedState, inb: &InboundConfig) {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+    use std::process::Stdio;
+
+    let port = inb.effective_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let mut child = match Command::new("cloudflared")
+        .args(["tunnel", "--url", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("cloudflared not available for {}: {e}", inb.name);
+            return;
+        }
+    };
+    let stderr = child.stderr.take();
+    {
+        let state = Arc::clone(state);
+        let name = inb.name.clone();
+        if let Some(err) = stderr {
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(host) = extract_tunnel_host(&line) {
+                        let mut cfg = state.config.write().await;
+                        if let Some(idx) = cfg.inbound_index(&name) {
+                            if cfg.inbounds[idx].server.as_deref() != Some(host.as_str()) {
+                                cfg.inbounds[idx].server = Some(host.clone());
+                                let _ = cfg.save(&state.config_path);
+                            }
+                        }
+                        tracing::info!("{} public tunnel ready: https://{host}", name);
+                        break;
+                    }
+                }
+            });
+        }
+    }
+    state.tunnels.lock().await.insert(inb.name.clone(), child);
+}
+
+fn extract_tunnel_host(line: &str) -> Option<String> {
+    let start = line.find("https://")? + "https://".len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
+    let host = rest[..end].trim_end_matches('.').to_string();
+    // Quick-tunnel hostnames look like `<random-words>.trycloudflare.com`.
+    // Skip the Cloudflare API endpoint and anything that isn't a random name.
+    if host.contains(".trycloudflare.com")
+        && host != "api.trycloudflare.com"
+        && host != "cftunnel.com"
+        && host.split('.').next().map_or(false, |n| n.contains('-'))
+    {
+        Some(host)
+    } else {
+        None
     }
 }
 
@@ -67,6 +140,12 @@ pub async fn restart_inbounds(state: &SharedState) {
     for (_, h) in handles {
         let _ = h.await;
     }
+    // Stop any cloudflared quick tunnels.
+    let tunnels = std::mem::take(&mut *state.tunnels.lock().await);
+    for (_, mut t) in tunnels {
+        let _ = t.kill().await;
+        let _ = t.wait().await;
+    }
     state.addrs.lock().await.clear();
     spawn_all(state).await;
 }
@@ -74,6 +153,8 @@ pub async fn restart_inbounds(state: &SharedState) {
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/api/login", post(login))
+        .route("/api/account", post(update_account))
         .route("/api/nodes", get(list_nodes).post(add_node))
         .route("/api/nodes/:name", get(get_node).put(update_node).delete(delete_node))
         .route("/api/subscription/regenerate", post(regenerate_subscription))
@@ -85,6 +166,65 @@ pub fn router(state: SharedState) -> Router {
 
 async fn index() -> impl IntoResponse {
     Html(include_str!("ui.html"))
+}
+
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+/// Login with username + password; returns the admin token used for API auth.
+async fn login(
+    State(state): State<SharedState>,
+    Json(body): Json<LoginBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let (user, pass, token) = {
+        let cfg = state.config.read().await;
+        (cfg.web.user.clone(), cfg.web.password.clone(), cfg.web.admin_token.clone())
+    };
+    if body.username == user && body.password == pass {
+        Ok(Json(json!({ "ok": true, "token": token, "username": user })))
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AccountBody {
+    old_password: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+/// Change the login username / password (requires the current password).
+async fn update_account(
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(body): Json<AccountBody>,
+) -> Result<Json<Value>, StatusCode> {
+    require_admin(headers, &state).await?;
+    {
+        let cfg = state.config.read().await;
+        if cfg.web.password != body.old_password {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    {
+        let mut cfg = state.config.write().await;
+        if let Some(u) = body.username {
+            if !u.is_empty() {
+                cfg.web.user = u;
+            }
+        }
+        if let Some(p) = body.password {
+            if !p.is_empty() {
+                cfg.web.password = p;
+            }
+        }
+        cfg.save(&state.config_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn unauthorized() -> StatusCode {
@@ -129,10 +269,18 @@ async fn subscription_handler(
     if got != token {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let fmt = params.get("format").cloned().unwrap_or_else(|| "raw".to_string());
     let cfg = state.config.read().await;
-    let body = util::build_subscription(&cfg.inbounds);
+    let body = subscription_body(&cfg.inbounds, &fmt);
     drop(cfg);
     (StatusCode::OK, body).into_response()
+}
+
+fn subscription_body(inbounds: &[InboundConfig], fmt: &str) -> String {
+    match fmt {
+        "clash" => util::build_clash_subscription(inbounds),
+        _ => util::build_subscription(inbounds),
+    }
 }
 
 async fn list_nodes(
@@ -271,12 +419,14 @@ async fn regenerate_subscription(
 }
 
 async fn get_subscription_text(
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     require_admin(headers, &state).await?;
+    let fmt = params.get("format").cloned().unwrap_or_else(|| "raw".to_string());
     let cfg = state.config.read().await;
-    let body = util::build_subscription(&cfg.inbounds);
+    let body = subscription_body(&cfg.inbounds, &fmt);
     Ok((StatusCode::OK, body))
 }
 

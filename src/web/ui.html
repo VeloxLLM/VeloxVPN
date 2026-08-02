@@ -18,7 +18,13 @@
   nav button { background: none; border: none; color: var(--muted); padding: 6px 14px; cursor: pointer; border-radius: 4px; font-size: 13px; }
   nav button.active { background: var(--bg3); color: var(--fg); }
   header .spacer { flex: 1; }
-  header input[type=password] { background: var(--bg3); border: 1px solid var(--border); color: var(--fg); padding: 5px 8px; border-radius: 4px; width: 180px; }
+  header .user-chip { color: var(--green); font-weight: 600; }
+  #loginScreen { position: fixed; inset: 0; background: rgba(14,17,22,0.92); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .login-box { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 28px; width: 300px; display: flex; flex-direction: column; gap: 12px; }
+  .login-box h2 { color: var(--accent); text-align: center; margin-bottom: 4px; }
+  .login-box input { background: var(--bg3); border: 1px solid var(--border); color: var(--fg); padding: 10px; border-radius: 4px; }
+  .login-box button { padding: 10px; }
+  .login-box #loginErr { color: var(--red); font-size: 12px; min-height: 14px; }
   main { flex: 1; display: flex; overflow: hidden; }
   .hidden { display: none !important; }
 
@@ -32,6 +38,7 @@
   button { background: var(--accent); color: #fff; border: none; padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
   button:hover { filter: brightness(1.1); }
   button.ghost { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); }
+  button.active-fmt { background: var(--accent); color: #fff; border-color: var(--accent); }
   button.danger { background: var(--red); }
 
   /* Admin tab */
@@ -65,7 +72,8 @@
     <button id="navAdmin" onclick="showTab('admin')">Admin</button>
   </nav>
   <div class="spacer"></div>
-  <input type="password" id="adminToken" placeholder="Admin token" onchange="saveToken()">
+  <span id="userChip" class="user-chip" title="logged in as"></span>
+  <button class="ghost" onclick="logout()">Logout</button>
 </header>
 <main>
   <div id="subTab">
@@ -75,6 +83,11 @@
         <input id="subUrl" readonly>
         <button class="ghost" onclick="copyUrl()">Copy</button>
         <button onclick="regenerate()">Regenerate</button>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px;align-items:center;">
+        <span style="color:var(--muted)">Format:</span>
+        <button id="fmtRaw" class="ghost active-fmt" onclick="setFormat('raw')">Raw URIs</button>
+        <button id="fmtClash" class="ghost" onclick="setFormat('clash')">Clash / Mihomo</button>
       </div>
     </div>
     <pre class="sub" id="subText">loading...</pre>
@@ -88,8 +101,7 @@
       <div id="emptyHint" class="card">Select a node from the left to edit, or create a new one.</div>
       <form id="nodeForm" class="hidden">
         <label>Name</label><input id="fName">
-        <label>Type</label><select id="fType"><option>vless</option><option>anytls</option><option>tuic</option></select>
-        <label>Listen</label><input id="fListen" value="0.0.0.0">
+        <label>Type</label><select id="fType"><option>vless</option><option>anytls</option><option>tuic</option></select>        <label>Listen</label><input id="fListen" value="0.0.0.0">
         <label>Port (0 = random)</label><input id="fPort" type="number" value="0">
         <label>UUID (vless)</label><input id="fUuid">
         <label>Password</label><input id="fPassword">
@@ -104,6 +116,17 @@
           <button type="button" class="danger" onclick="deleteNode()">Delete</button>
         </div>
       </form>
+      <div class="card" style="margin-top:14px;max-width:620px;">
+        <h3>Account / 账号</h3>
+        <form>
+          <label>Current password</label><input id="aOldPass" type="password" placeholder="current password">
+          <label>New username</label><input id="aUser" placeholder="admin">
+          <label>New password</label><input id="aPass" type="password" placeholder="leave blank to keep">
+          <div class="actions">
+            <button type="button" onclick="updateAccount()">Save account</button>
+          </div>
+        </form>
+      </div>
     </section>
   </div>
 </main>
@@ -111,25 +134,62 @@
   <div class="bar"><span id="statusText">connecting...</span><span>VeloxVPN</span></div>
   <pre id="term"></pre>
 </footer>
+<div id="loginScreen">
+  <div class="login-box">
+    <h2>VeloxVPN</h2>
+    <input id="loginUser" placeholder="Username" value="admin" autocomplete="username">
+    <input id="loginPass" type="password" placeholder="Password" value="admin1234" autocomplete="current-password">
+    <button id="loginBtn" onclick="doLogin()">Login</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
 <script>
 let nodes = [];
 let current = null;
 const TOKEN_KEY = "veloxvpn_admin_token";
+const USER_KEY = "veloxvpn_username";
 
-function token() { return document.getElementById("adminToken").value || localStorage.getItem(TOKEN_KEY) || ""; }
-function saveToken() { localStorage.setItem(TOKEN_KEY, token()); }
+function token() { return localStorage.getItem(TOKEN_KEY) || ""; }
 window.addEventListener("DOMContentLoaded", () => {
-  const saved = localStorage.getItem(TOKEN_KEY);
-  if (saved) document.getElementById("adminToken").value = saved;
+  if (!token()) { document.getElementById("loginScreen").style.display = "flex"; return; }
+  document.getElementById("userChip").textContent = localStorage.getItem(USER_KEY) || "admin";
+  boot();
+});
+async function boot() {
   loadStatus();
   setInterval(loadStatus, 3000);
-});
+}
+async function doLogin() {
+  const username = document.getElementById("loginUser").value.trim();
+  const password = document.getElementById("loginPass").value;
+  const err = document.getElementById("loginErr");
+  try {
+    const r = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { err.textContent = "login failed: " + (data.message || r.status); return; }
+    localStorage.setItem(TOKEN_KEY, data.token);
+    localStorage.setItem(USER_KEY, data.username);
+    document.getElementById("userChip").textContent = data.username;
+    document.getElementById("loginScreen").style.display = "none";
+    err.textContent = "";
+    boot();
+  } catch (e) { err.textContent = "login error: " + e.message; }
+}
+function logout() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  location.reload();
+}
 
 async function api(path, opts = {}) {
   const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   if (token()) headers["X-Admin-Token"] = token();
   const r = await fetch(path, Object.assign({}, opts, { headers }));
-  if (r.status === 401) throw new Error("unauthorized: check admin token");
+  if (r.status === 401) throw new Error("unauthorized: session expired");
   if (!r.ok) throw new Error(path + " -> " + r.status);
   return r.json();
 }
@@ -147,7 +207,8 @@ async function loadStatus() {
     const s = await api("/api/status");
     const sub = s.subscription;
     const base = sub.url.base;
-    document.getElementById("subUrl").value = base + sub.path + "?token=" + sub.token;
+    const fmtParam = subFmt === "clash" ? "&format=clash" : "";
+    document.getElementById("subUrl").value = base + sub.path + "?token=" + sub.token + fmtParam;
     const rows = s.nodes.map(n => n.name + "  [" + n.type + "]  " + (n.addr || (n.port)) + "  via:" + (n.via || "-")).join("\n");
     document.getElementById("statusText").textContent = "nodes: " + s.nodes.length + " | " + rows.split("\n")[0] || "running";
     document.getElementById("term").textContent = rows || "no inbounds";
@@ -157,9 +218,19 @@ async function loadStatus() {
   }
 }
 
+let subFmt = "raw";
+function setFormat(f) {
+  subFmt = f;
+  document.getElementById("fmtRaw").classList.toggle("active-fmt", f === "raw");
+  document.getElementById("fmtClash").classList.toggle("active-fmt", f === "clash");
+  loadStatus();
+  loadSubText();
+}
+
 async function loadSubText() {
   try {
-    const r = await fetch("/api/subscription", { headers: token() ? { "X-Admin-Token": token() } : {} });
+    const url = "/api/subscription" + (subFmt === "clash" ? "?format=clash" : "");
+    const r = await fetch(url, { headers: token() ? { "X-Admin-Token": token() } : {} });
     document.getElementById("subText").textContent = await r.text();
   } catch (e) { document.getElementById("subText").textContent = "error: " + e.message; }
 }
@@ -281,7 +352,25 @@ async function remove(name) {
   } catch (e) { alert(e.message); }
 }
 
-loadSubText();
+async function updateAccount() {
+  const body = {
+    old_password: document.getElementById("aOldPass").value,
+    username: document.getElementById("aUser").value.trim() || null,
+    password: document.getElementById("aPass").value || null
+  };
+  try {
+    const d = await api("/api/account", { method: "POST", body: JSON.stringify(body) });
+    if (body.username) {
+      localStorage.setItem(USER_KEY, body.username);
+      document.getElementById("userChip").textContent = body.username;
+    }
+    document.getElementById("aOldPass").value = "";
+    document.getElementById("aPass").value = "";
+    alert("account updated");
+  } catch (e) { alert(e.message); }
+}
+
+if (token()) loadSubText();
 </script>
 </body>
 </html>

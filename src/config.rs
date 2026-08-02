@@ -30,8 +30,20 @@ pub struct WebConfig {
     pub listen: String,
     #[serde(default)]
     pub admin_token: String,
+    #[serde(default = "default_user")]
+    pub user: String,
+    #[serde(default = "default_password")]
+    pub password: String,
     #[serde(default = "default_ui_title")]
     pub title: String,
+}
+
+fn default_user() -> String {
+    "admin".to_string()
+}
+
+fn default_password() -> String {
+    "admin1234".to_string()
 }
 
 fn default_ui_title() -> String {
@@ -161,6 +173,8 @@ impl Default for Config {
             web: WebConfig {
                 listen: "127.0.0.1:8080".to_string(),
                 admin_token: util::random_token(24),
+                user: "admin".to_string(),
+                password: "admin1234".to_string(),
                 title: "VeloxVPN".to_string(),
             },
             subscription: SubscriptionConfig {

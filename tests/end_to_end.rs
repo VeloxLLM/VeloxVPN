@@ -321,6 +321,7 @@ async fn make_state(dir: &PathBuf) -> (Arc<AppState>, tokio::net::TcpListener) {
         identity: id,
         handles: Arc::new(Mutex::new(Default::default())),
         addrs: Arc::new(Mutex::new(Default::default())),
+        tunnels: Arc::new(Mutex::new(Default::default())),
     });
     web::spawn_all(&state).await;
     (state, tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
@@ -377,14 +378,82 @@ async fn test_web_full() {
     let res = router.clone().oneshot(http_request(&uri, "GET", None, None)).await.unwrap();
     assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
 
+    // clash format subscription
+    let uri = format!("{}?token={}&format=clash", path, token);
+    let res = router.clone().oneshot(http_request(&uri, "GET", None, None)).await.unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let clash = String::from_utf8_lossy(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).to_string();
+    assert!(clash.contains("proxies:"));
+    assert!(clash.contains("type: vless"));
+    assert!(clash.contains("type: anytls"));
+    assert!(clash.contains("type: tuic"));
+    assert!(clash.contains("proxy-groups:"));
+    assert!(clash.contains("rules:"));
+    assert!(clash.contains("GEOIP,CN,DIRECT"));
+    assert!(clash.contains("MATCH,PROXY"));
+
     // admin API without token -> 401
     let res = router.clone().oneshot(http_request("/api/nodes", "GET", None, None)).await.unwrap();
     assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-    let admin_token = {
-        let cfg = state.config.read().await;
-        cfg.web.admin_token.clone()
-    };
+    // login with default credentials
+    let res = router
+        .clone()
+        .oneshot(http_request(
+            "/api/login",
+            "POST",
+            None,
+            Some(serde_json::json!({ "username": "admin", "password": "admin1234" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let login_token = json["token"].as_str().unwrap().to_string();
+    assert_eq!(login_token, state.config.read().await.web.admin_token);
+
+    // wrong credentials -> 401
+    let res = router
+        .clone()
+        .oneshot(http_request(
+            "/api/login",
+            "POST",
+            None,
+            Some(serde_json::json!({ "username": "admin", "password": "wrong" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    // change account credentials (requires current password)
+    let res = router
+        .clone()
+        .oneshot(http_request(
+            "/api/account",
+            "POST",
+            Some(&login_token),
+            Some(serde_json::json!({ "old_password": "admin1234", "username": "boss", "password": "newpass99" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    assert_eq!(state.config.read().await.web.user, "boss");
+    assert_eq!(state.config.read().await.web.password, "newpass99");
+
+    // new credentials work
+    let res = router
+        .clone()
+        .oneshot(http_request(
+            "/api/login",
+            "POST",
+            None,
+            Some(serde_json::json!({ "username": "boss", "password": "newpass99" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+    let admin_token = state.config.read().await.web.admin_token.clone();
 
     // regenerate subscription
     let res = router
