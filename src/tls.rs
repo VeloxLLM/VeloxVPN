@@ -1,4 +1,4 @@
-//! TLS helpers shared by AnyTLS (tokio-rustls) and Hysteria2 (quinn).
+//! TLS helpers shared by AnyTLS (tokio-rustls) and TUIC (quinn).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -89,8 +89,8 @@ pub fn rustls_client_config(
     Ok(Arc::new(cfg))
 }
 
-/// quinn server config (rustls 0.23 inside), ALPN "hysteria".
-pub fn quinn_server_config(id: &TlsIdentity) -> Result<quinn::ServerConfig, String> {
+/// quinn server config (rustls 0.23 inside) with the given ALPN.
+pub fn quinn_server_config(id: &TlsIdentity, alpn: &[&[u8]]) -> Result<quinn::ServerConfig, String> {
     ensure_provider();
     let cert = rustls::pki_types::CertificateDer::from(id.cert_der.clone());
     let key = rustls::pki_types::PrivateKeyDer::try_from(id.key_der.clone())
@@ -99,15 +99,19 @@ pub fn quinn_server_config(id: &TlsIdentity) -> Result<quinn::ServerConfig, Stri
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .map_err(|e| e.to_string())?;
-    cfg.alpn_protocols = vec![b"hysteria".to_vec(), b"h3".to_vec()];
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)
         .map_err(|e| e.to_string())?;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
 }
 
-/// quinn client config (rustls 0.23 inside), ALPN "hysteria".
+/// quinn client config (rustls 0.23 inside) with the given ALPN.
 /// Trusts our own identity cert, or skips verification when `insecure`.
-pub fn quinn_client_config(id: &TlsIdentity, insecure: bool) -> Result<quinn::ClientConfig, String> {
+pub fn quinn_client_config(
+    id: &TlsIdentity,
+    insecure: bool,
+    alpn: &[&[u8]],
+) -> Result<quinn::ClientConfig, String> {
     ensure_provider();
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let cfg = if insecure {
@@ -128,7 +132,7 @@ pub fn quinn_client_config(id: &TlsIdentity, insecure: bool) -> Result<quinn::Cl
             .with_no_client_auth()
     };
     let mut cfg = cfg;
-    cfg.alpn_protocols = vec![b"hysteria".to_vec(), b"h3".to_vec()];
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
         .map_err(|e| e.to_string())?;
     Ok(quinn::ClientConfig::new(Arc::new(quic)))

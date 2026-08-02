@@ -130,23 +130,18 @@ pub fn build_uri(inb: &InboundConfig) -> Option<String> {
                 urlencoding::encode(name)
             ))
         }
-        Protocol::Hysteria2 => {
-            let password = inb.password.as_ref()?;
+        Protocol::Tuic => {
+            let uuid = inb.uuid.as_ref()?;
+            let password = inb.password.as_deref().unwrap_or("");
             let (host, port) = public_host(inb, 443);
             let sni = inb.sni.as_deref().unwrap_or("www.cloudflare.com");
-            let mut q = format!("sni={}", urlencoding::encode(sni));
-            if let Some(obfs) = &inb.obfs {
-                q.push_str(&format!("&obfs={}", urlencoding::encode(obfs)));
-                if let Some(p) = &inb.password {
-                    q.push_str(&format!("&obfs-password={}", urlencoding::encode(p)));
-                }
-            }
             Some(format!(
-                "hysteria2://{}@{}:{}?{}&insecure=1#{}",
+                "tuic://{}:{}@{}:{}?sni={}&alpn=h3&congestion_control=bbr&udp_relay_mode=native#{}",
+                urlencoding::encode(uuid),
                 urlencoding::encode(password),
                 host,
                 port,
-                q,
+                urlencoding::encode(sni),
                 urlencoding::encode(name)
             ))
         }

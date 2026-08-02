@@ -12,7 +12,7 @@ use crate::util;
 pub enum Protocol {
     Vless,
     AnyTls,
-    Hysteria2,
+    Tuic,
 }
 
 impl Protocol {
@@ -20,7 +20,7 @@ impl Protocol {
         match self {
             Protocol::Vless => "vless",
             Protocol::AnyTls => "anytls",
-            Protocol::Hysteria2 => "hysteria2",
+            Protocol::Tuic => "tuic",
         }
     }
 }
@@ -205,19 +205,19 @@ impl Default for Config {
                     port_assigned: None,
                 },
                 InboundConfig {
-                    name: "hy2-main".to_string(),
-                    typ: Protocol::Hysteria2,
+                    name: "tuic-main".to_string(),
+                    typ: Protocol::Tuic,
                     listen: "0.0.0.0".to_string(),
                     port: 0,
-                    uuid: None,
+                    uuid: Some(uuid::Uuid::new_v4().to_string()),
                     password: Some(util::random_token(24)),
                     network: None,
                     host: None,
                     path: None,
                     via: None,
                     sni: Some("www.cloudflare.com".to_string()),
-                    alpn: Some(vec!["h2".to_string(), "http/1.1".to_string()]),
-                    obfs: Some("salamander".to_string()),
+                    alpn: Some(vec!["h3".to_string()]),
+                    obfs: None,
                     server: None,
                     port_assigned: None,
                 },
@@ -257,7 +257,7 @@ impl Config {
             changed = true;
         }
 
-        // Generate a self-signed certificate for TLS inbound (anytls/hy2) once.
+        // Generate a self-signed certificate for TLS inbound (anytls/tuic) once.
         let cert_file = path.with_file_name("cert.pem");
         let key_file = path.with_file_name("key.pem");
         if !cert_file.exists() || !key_file.exists() {

@@ -1,4 +1,4 @@
-//! VeloxVPN library: VLESS / AnyTLS / Hysteria2 proxy with a local web UI.
+//! VeloxVPN library: VLESS / AnyTLS / TUIC proxy with a local web UI.
 
 pub mod config;
 pub mod proxy;

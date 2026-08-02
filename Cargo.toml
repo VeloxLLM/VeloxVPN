@@ -1,8 +1,8 @@
 [package]
 name = "veloxvpn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A lightweight Rust VPN/proxy supporting VLESS, AnyTLS and Hysteria2 with a local web UI"
+description = "A lightweight Rust VPN/proxy supporting VLESS, AnyTLS and TUIC with a local web UI"
 license = "MIT"
 
 [[bin]]

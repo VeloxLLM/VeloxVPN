@@ -2,7 +2,7 @@
 
 pub mod address;
 pub mod anytls;
-pub mod hy2;
+pub mod tuic;
 pub mod vless;
 
 use std::net::SocketAddr;
@@ -62,13 +62,14 @@ pub async fn start_inbound(
             let cfg = crate::tls::rustls_server_config(identity, &alpn)?;
             anytls::serve(&listen, password, cfg).await
         }
-        Protocol::Hysteria2 => {
+        Protocol::Tuic => {
+            let uuid = parse_uuid(inb.uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"))?;
             let password = inb
                 .password
                 .clone()
                 .unwrap_or_else(|| "".to_string());
-            let cfg = crate::tls::quinn_server_config(identity)?;
-            hy2::serve(&listen, password, cfg).await
+            let cfg = crate::tls::quinn_server_config(identity, &[b"h3"])?;
+            tuic::serve(&listen, uuid, password, cfg).await
         }
     }
 }

@@ -1,18 +1,18 @@
 # VeloxVPN
 
-> A lightweight, high-performance VPN / proxy client written in Rust — only VLESS, AnyTLS and Hysteria2, plus a simple local web UI.
+> A lightweight, high-performance VPN / proxy client written in Rust — only VLESS, AnyTLS and TUIC, plus a simple local web UI.
 >
-> 用 Rust 编写的高性能、轻量级 VPN / 代理客户端 —— 只支持 VLESS、AnyTLS、Hysteria2 三种协议，并自带一个简洁的本地 Web 管理界面。
+> 用 Rust 编写的高性能、轻量级 VPN / 代理客户端 —— 只支持 VLESS、AnyTLS、TUIC 三种协议，并自带一个简洁的本地 Web 管理界面。
 
 ---
 
 ## Features / 特性
 
-- **Only 3 protocols** — VLESS, AnyTLS, Hysteria2. No extra bloat. / 只支持 VLESS、AnyTLS、Hysteria2 三种协议，没有多余功能。
+- **Only 3 protocols** — VLESS, AnyTLS, TUIC. No extra bloat. / 只支持 VLESS、AnyTLS、TUIC 三种协议，没有多余功能。
 - **Simple local Web UI** — a browser-based panel (similar to a Cloud9-style web terminal) with two modules: **Subscription URL** and **Admin**. / 简洁的本地 Web 管理界面，类似 Cloud9 风格的 Web 面板，包含两个模块：**订阅地址** 与 **管理后台**。
 - **Rust & async** — high performance, low memory footprint, memory-safe. / 基于 Rust 异步运行时，性能高、内存占用低、内存安全。
 - **Random ports** — every inbound gets a randomly generated port **once at first startup, then fixed** (persisted in config). / 全部入站使用**随机端口**，**首次启动时生成一次，此后保持不变**（持久化到配置）。
-- **Anti-blocking** — VLESS over **WS + Host header**, configurable **SNI / ALPN**, and Hysteria2 **obfs** for TLS/QUIC camouflage. / **抗封锁**：VLESS 走 **WS + Host 头**，可配置 **SNI / ALPN**，Hysteria2 带 **obfs** 混淆。
+- **Anti-blocking** — VLESS over **WS + Host header**, configurable **SNI / ALPN** for TLS/QUIC camouflage. / **抗封锁**：VLESS 走 **WS + Host 头**，可配置 **SNI / ALPN** 伪装。
 - **Cross-platform** — Windows / macOS / Linux. / 跨平台：Windows / macOS / Linux。
 
 ## Protocol Support / 协议支持
@@ -21,9 +21,9 @@
 | ---------------- | -------------- | ---------------- |
 | VLESS           | ✅ via Cloudflare Quick Tunnel / 经 Cloudflare 快速隧道 | ✅ |
 | AnyTLS          | ✅ own IP:port / 自有 IP 与端口 | ✅ |
-| Hysteria2 (hy2) | ✅ own IP:port / 自有 IP 与端口 | ✅ |
+| TUIC            | ✅ own IP:port / 自有 IP 与端口 | ✅ |
 
-> **Only VLESS goes through the Cloudflare Quick Tunnel; AnyTLS and Hysteria2 listen directly on the server's own IP and port.** / **只有 VLESS 走 Cloudflare 快速隧道，AnyTLS 和 Hysteria2 直接使用服务器自有 IP 与端口。**
+> **Only VLESS goes through the Cloudflare Quick Tunnel; AnyTLS and TUIC listen directly on the server's own IP and port.** / **只有 VLESS 走 Cloudflare 快速隧道，AnyTLS 和 TUIC 直接使用服务器自有 IP 与端口。**
 
 ## Exposure Model / 暴露模型
 
@@ -32,17 +32,17 @@
    VLESS  (127.0.0.1:local) ── cloudflared quick tunnel ──▶ xxx.trycloudflare.com
                           │                                │
    AnyTLS  (own IP:443/TCP)        ◀──── public ────        │
-   Hysteria2 (own IP:443/UDP)      ◀──── public ────        │
+   TUIC    (own IP:443/UDP)        ◀──── public ────        │
                           └────────────────────────────────┘
 ```
 
 - **VLESS** — listens on a local random port, transports over **WebSocket with a custom Host header**, and is published through a random `cloudflared` quick tunnel (trycloudflare.com, no login). / 监听本地随机端口，通过 **WebSocket + 自定义 Host 头**传输，并经随机 `cloudflared` 快速隧道发布（无需登录）。
-- **AnyTLS & Hysteria2** — bind directly to the server's public IP on a **randomly assigned port (fixed after first startup)**, with custom **SNI / ALPN** for camouflage. / 直接绑定服务器公网 IP，使用**随机分配的端口（首次启动后固定）**，并设置 **SNI / ALPN** 伪装。
-- Cloudflare Quick Tunnels proxy HTTP/WS/TCP only, which is why only TCP-based VLESS uses it; Hysteria2 (QUIC/UDP) and AnyTLS cannot be exposed that way. / 快速隧道只转发 HTTP/WS/TCP，因此只有基于 TCP 的 VLESS 使用它；Hysteria2（QUIC/UDP）无法用此方式暴露。
+- **AnyTLS & TUIC** — bind directly to the server's public IP on a **randomly assigned port (fixed after first startup)**, with custom **SNI / ALPN** for camouflage. / 直接绑定服务器公网 IP，使用**随机分配的端口（首次启动后固定）**，并设置 **SNI / ALPN** 伪装。
+- Cloudflare Quick Tunnels proxy HTTP/WS/TCP only, which is why only TCP-based VLESS uses it; TUIC (QUIC/UDP) and AnyTLS cannot be exposed that way. / 快速隧道只转发 HTTP/WS/TCP，因此只有基于 TCP 的 VLESS 使用它；TUIC（QUIC/UDP）无法用此方式暴露。
 
 ### SNI & ALPN for anti-blocking / SNI 与 ALPN 抗封锁
 
-Every inbound (AnyTLS / Hysteria2) supports custom **SNI** and **ALPN** so the TLS handshake mimics a normal website and resists active probing. / 每个入站（AnyTLS / Hysteria2）都支持自定义 **SNI** 和 **ALPN**，让 TLS 握手伪装成正常网站流量，抵抗主动探测。
+Every inbound (AnyTLS / TUIC) supports custom **SNI** and **ALPN** so the TLS handshake mimics a normal website and resists active probing. / 每个入站（AnyTLS / TUIC）都支持自定义 **SNI** 和 **ALPN**，让 TLS 握手伪装成正常网站流量，抵抗主动探测。
 
 | Field / 字段 | Example / 示例 | Purpose / 作用 |
 | ------------- | -------------- | -------------- |
@@ -54,9 +54,9 @@ Every inbound (AnyTLS / Hysteria2) supports custom **SNI** and **ALPN** so the T
 ### Applied by default / 默认启用
 
 - **TLS 1.3 + standard cipher suites** for all protocols — the TLS config is uniform and conservative, avoiding unusual extensions that are easy to fingerprint. / 所有协议统一使用 **TLS 1.3 + 标准密码套件**，TLS 配置保持一致、保守，避免被指纹识别的特殊扩展。
-- **SNI + ALPN camouflage** — every AnyTLS / Hysteria2 inbound presents a decoy SNI and normal web ALPN during the handshake. / 每个 AnyTLS / Hysteria2 入站在握手时呈现伪装的 SNI 和正常的 Web ALPN。
+- **SNI + ALPN camouflage** — every AnyTLS / TUIC inbound presents a decoy SNI and normal web ALPN during the handshake. / 每个 AnyTLS / TUIC 入站在握手时呈现伪装的 SNI 和正常的 Web ALPN。
 - **VLESS over WebSocket + Host header** — wrapped inside Cloudflare Quick Tunnel, so the flow looks like ordinary WS/HTTP traffic through a CDN. / VLESS 使用 **WebSocket + Host 头**，经 Cloudflare 快速隧道封装，流量表现为经过 CDN 的普通 WS/HTTP。
-- **Hysteria2 obfs (salamander)** — protocol-level obfuscation for QUIC. / Hysteria2 的 **obfs（salamander）** 协议级混淆。
+- **TUIC over QUIC** — TLS 1.3 with `h3` ALPN and BBR congestion control, low-latency and hard to fingerprint. / TUIC 基于 QUIC + TLS 1.3，`h3` ALPN，BBR 拥塞控制，低延迟、难被指纹识别。
 - **Random fixed ports** — all inbounds use randomly assigned ports (fixed after first startup), avoiding the commonly monitored 443/80. / 所有入站使用随机分配端口（首次启动后固定），避开常见的 443/80 监测端口。
 
 ### Future / optional ideas (not implemented yet) / 后续可选（暂未实现）
@@ -120,14 +120,14 @@ Create a `config.json` like this: / 配置示例 `config.json`：
       "alpn": ["h2", "http/1.1"]
     },
     {
-      "name": "hy2-main",
-      "type": "hysteria2",
+      "name": "tuic-main",
+      "type": "tuic",
       "listen": "0.0.0.0",
       "port": 0,
+      "uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
       "password": "your-password",
-      "obfs": "salamander",
       "sni": "www.cloudflare.com",
-      "alpn": ["h2", "http/1.1"]
+      "alpn": ["h3"]
     }
   ],
   "outbounds": [
@@ -146,12 +146,14 @@ Create a `config.json` like this: / 配置示例 `config.json`：
       "password": "your-password"
     },
     {
-      "name": "my-hy2",
-      "type": "hysteria2",
+      "name": "my-tuic",
+      "type": "tuic",
       "server": "example.com",
       "port": 443,
+      "uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
       "password": "your-password",
-      "obfs": "salamander"
+      "sni": "www.cloudflare.com",
+      "alpn": ["h3"]
     }
   ]
 }
@@ -180,7 +182,7 @@ The admin module uses a **Cloud9-style IDE layout** (dark theme, reference: AWS 
 │  Sidebar  │  Inbound Nodes / 入站节点                       │
 │  · VLESS  │  ┌──────────────────────────────────────────┐  │
 │  · AnyTLS │  │  node card / 节点卡片 (type · addr · port) │  │  ← editor area / 编辑区
-│  · hy2    │  └──────────────────────────────────────────┘  │
+│  · TUIC   │  └──────────────────────────────────────────┘  │
 │  · Add+   │  ┌──────────────────────────────────────────┐  │
 │  · Sub URL│  │  node card / 节点卡片                     │  │
 │           │  └──────────────────────────────────────────┘  │
@@ -190,7 +192,7 @@ The admin module uses a **Cloud9-style IDE layout** (dark theme, reference: AWS 
 ```
 
 - **Top toolbar** — module switches: Nodes / Subscription / Status. / 顶部工具栏：节点 / 订阅 / 状态 模块切换。
-- **Left sidebar** — inbound node list (VLESS / AnyTLS / hy2) with an "Add" button. / 左侧边栏：入站节点列表，含「添加」按钮。
+- **Left sidebar** — inbound node list (VLESS / AnyTLS / TUIC) with an "Add" button. / 左侧边栏：入站节点列表，含「添加」按钮。
 - **Center editor area** — node cards / detail editing forms, one tab per node. / 中间编辑区：节点卡片 / 详情编辑表单，每个节点一个标签页。
 - **Bottom panel** — real-time connection logs like a terminal. / 底部面板：类似终端的实时连接日志。
 - **Admin actions** — regenerate subscription URL, set SNI / ALPN, add / edit / delete nodes, view status. Ports are fixed after first startup and are **not** regenerated. / 管理操作：重新生成订阅地址、设置 SNI / ALPN、增删改节点、查看状态。端口在首次启动后固定，**不会重新生成**。
@@ -210,7 +212,7 @@ veloxvpn/
 │   │   ├── address.rs   # SOCKS-style target address / 目标地址解析
 │   │   ├── vless.rs     # VLESS inbound + outbound (TCP / WS) / VLESS 出入站
 │   │   ├── anytls.rs    # AnyTLS inbound + outbound / AnyTLS 出入站
-│   │   └── hy2.rs       # Hysteria2 inbound + outbound (QUIC) / Hysteria2 出入站
+│   │   └── tuic.rs      # TUIC inbound + outbound (QUIC) / TUIC 出入站
 │   └── web/
 │       ├── mod.rs       # Web server: subscription + admin API / Web 服务
 │       └── ui.html      # Cloud9-style admin panel / Cloud9 风格管理界面

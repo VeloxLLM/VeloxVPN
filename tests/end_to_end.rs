@@ -202,29 +202,30 @@ async fn test_anytls() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// ---------- Hysteria2 ----------
+// ---------- TUIC ----------
 
 #[tokio::test]
-async fn test_hysteria2() {
+async fn test_tuic() {
     init_logs();
-    let dir = temp_dir("hy2");
+    let dir = temp_dir("tuic");
     let _cfg = make_config(&dir).await;
     let id = identity(&dir).await;
+    let uuid = [9u8; 16];
 
     let inb = InboundConfig {
-        name: "hy2".into(),
-        typ: Protocol::Hysteria2,
+        name: "tuic".into(),
+        typ: Protocol::Tuic,
         listen: "127.0.0.1".into(),
         port: 0,
-        uuid: None,
-        password: Some("hy2secret".into()),
+        uuid: Some("09090909-0909-0909-0909-090909090909".into()),
+        password: Some("tuicsecret".into()),
         network: None,
         host: None,
         path: None,
         via: None,
         sni: Some("localhost".into()),
-        alpn: Some(vec!["h2".into()]),
-        obfs: Some("salamander".into()),
+        alpn: Some(vec!["h3".into()]),
+        obfs: None,
         server: None,
         port_assigned: Some(util::random_port()),
     };
@@ -232,9 +233,9 @@ async fn test_hysteria2() {
     let (addr, handle) = proxy::start_inbound(&inb, &id).await.unwrap();
     let target = echo_server().await;
 
-    let client = proxy::hy2::Hy2Client::connect(&id, false, "127.0.0.1", addr.port(), "localhost", "hy2secret")
+    let client = proxy::tuic::TuicClient::connect(&id, false, "127.0.0.1", addr.port(), "localhost", &uuid, "tuicsecret")
         .await
-        .expect("hy2 connect");
+        .expect("tuic connect");
     let (mut send, mut recv) = client.open_tcp(&target).await.unwrap();
     echo_roundtrip(&mut recv, &mut send).await;
     drop(send);
@@ -303,7 +304,7 @@ async fn test_web_full() {
     let body = String::from_utf8_lossy(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).to_string();
     assert!(body.contains("vless://"));
     assert!(body.contains("anytls://"));
-    assert!(body.contains("hysteria2://"));
+    assert!(body.contains("tuic://"));
 
     // subscription: wrong token -> 404
     let uri = format!("{}?token=bad", path);
