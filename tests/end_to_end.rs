@@ -202,6 +202,72 @@ async fn test_anytls() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// A UDP echo server used to verify TUIC UDP relay.
+async fn udp_echo_server() -> Addr {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    let _ = sock.send_to(&buf[..n], src).await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Addr::Ip(addr.ip(), addr.port())
+}
+
+#[tokio::test]
+async fn test_tuic_udp() {
+    init_logs();
+    let dir = temp_dir("tuic-udp");
+    let _cfg = make_config(&dir).await;
+    let id = identity(&dir).await;
+    let uuid = [10u8; 16];
+
+    let inb = InboundConfig {
+        name: "tuic".into(),
+        typ: Protocol::Tuic,
+        listen: "127.0.0.1".into(),
+        port: 0,
+        uuid: Some("0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a".into()),
+        password: Some("tuicsecret".into()),
+        network: None,
+        host: None,
+        path: None,
+        via: None,
+        sni: Some("localhost".into()),
+        alpn: Some(vec!["h3".into()]),
+        obfs: None,
+        server: None,
+        port_assigned: Some(util::random_port()),
+    };
+
+    let (addr, handle) = proxy::start_inbound(&inb, &id).await.unwrap();
+    let echo_addr = udp_echo_server().await;
+
+    let client = proxy::tuic::TuicClient::connect(&id, false, "127.0.0.1", addr.port(), "localhost", &uuid, "tuicsecret")
+        .await
+        .expect("tuic connect");
+    let mut udp = client.open_udp().await;
+
+    let payload = b"velox-udp-ping-1234";
+    udp.send_to(&echo_addr, payload).await.expect("send_to");
+    let (src, reply) = tokio::time::timeout(std::time::Duration::from_secs(10), udp.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv closed");
+    assert_eq!(&reply[..], payload);
+    assert_eq!(src.port(), echo_addr.port());
+
+    drop(udp);
+    handle.abort();
+    std::fs::remove_dir_all(dir).ok();
+}
+
 // ---------- TUIC ----------
 
 #[tokio::test]

@@ -56,7 +56,7 @@ Every inbound (AnyTLS / TUIC) supports custom **SNI** and **ALPN** so the TLS ha
 - **TLS 1.3 + standard cipher suites** for all protocols — the TLS config is uniform and conservative, avoiding unusual extensions that are easy to fingerprint. / 所有协议统一使用 **TLS 1.3 + 标准密码套件**，TLS 配置保持一致、保守，避免被指纹识别的特殊扩展。
 - **SNI + ALPN camouflage** — every AnyTLS / TUIC inbound presents a decoy SNI and normal web ALPN during the handshake. / 每个 AnyTLS / TUIC 入站在握手时呈现伪装的 SNI 和正常的 Web ALPN。
 - **VLESS over WebSocket + Host header** — wrapped inside Cloudflare Quick Tunnel, so the flow looks like ordinary WS/HTTP traffic through a CDN. / VLESS 使用 **WebSocket + Host 头**，经 Cloudflare 快速隧道封装，流量表现为经过 CDN 的普通 WS/HTTP。
-- **TUIC over QUIC** — TLS 1.3 with `h3` ALPN and BBR congestion control, low-latency and hard to fingerprint. / TUIC 基于 QUIC + TLS 1.3，`h3` ALPN，BBR 拥塞控制，低延迟、难被指纹识别。
+- **TUIC over QUIC** — TLS 1.3 with `h3` ALPN and **BBR** congestion control, TCP + UDP relay (native datagram mode with 0-RTT full-cone UDP). / TUIC 基于 QUIC + TLS 1.3，`h3` ALPN，**BBR** 拥塞控制，支持 TCP 与 UDP 中继（native datagram 模式，0-RTT full-cone）。
 - **Random fixed ports** — all inbounds use randomly assigned ports (fixed after first startup), avoiding the commonly monitored 443/80. / 所有入站使用随机分配端口（首次启动后固定），避开常见的 443/80 监测端口。
 
 ### Future / optional ideas (not implemented yet) / 后续可选（暂未实现）

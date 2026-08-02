@@ -89,6 +89,15 @@ pub fn rustls_client_config(
     Ok(Arc::new(cfg))
 }
 
+/// QUIC transport tuning: BBR congestion control + datagram buffers (for TUIC UDP relay).
+pub fn quinn_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.datagram_receive_buffer_size(Some(256 * 1024));
+    tc.datagram_send_buffer_size(64 * 1024);
+    tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    Arc::new(tc)
+}
+
 /// quinn server config (rustls 0.23 inside) with the given ALPN.
 pub fn quinn_server_config(id: &TlsIdentity, alpn: &[&[u8]]) -> Result<quinn::ServerConfig, String> {
     ensure_provider();
@@ -102,7 +111,9 @@ pub fn quinn_server_config(id: &TlsIdentity, alpn: &[&[u8]]) -> Result<quinn::Se
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)
         .map_err(|e| e.to_string())?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    server.transport_config(quinn_transport_config());
+    Ok(server)
 }
 
 /// quinn client config (rustls 0.23 inside) with the given ALPN.
@@ -135,7 +146,9 @@ pub fn quinn_client_config(
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
         .map_err(|e| e.to_string())?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut client = quinn::ClientConfig::new(Arc::new(quic));
+    client.transport_config(quinn_transport_config());
+    Ok(client)
 }
 
 /// Accept any server certificate (for insecure mode).
