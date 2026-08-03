@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -35,6 +35,13 @@ const CMD_DISSOCIATE: u8 = 0x03;
 const CMD_HEARTBEAT: u8 = 0x04;
 
 const AUTH_LEN: usize = 2 + 16 + 32; // VER + CMD + uuid + token
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+type FragmentKey = (u16, u16);
+type FragmentList = Vec<(u8, Vec<u8>)>;
+type FragmentMap = Arc<Mutex<HashMap<FragmentKey, FragmentList>>>;
+type UdpReply = (SocketAddr, Vec<u8>);
+type UdpSenderMap = Arc<Mutex<HashMap<u16, mpsc::Sender<UdpReply>>>>;
 
 /// Start a TUIC inbound. Returns (bound addr, task handle).
 pub async fn serve(
@@ -191,8 +198,7 @@ async fn handle_conn(conn: quinn::Connection, uuid: [u8; 16], password: &str) {
     let authenticated = Arc::new(AtomicBool::new(false));
     let notify = Arc::new(tokio::sync::Notify::new());
     let sessions: Arc<Mutex<HashMap<u16, UdpSession>>> = Arc::new(Mutex::new(HashMap::new()));
-    let fragments: Arc<Mutex<HashMap<(u16, u16), Vec<(u8, Vec<u8>)>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let fragments: FragmentMap = Arc::new(Mutex::new(HashMap::new()));
 
     // Uni-stream loop: auth / packet / dissociate.
     {
@@ -201,10 +207,12 @@ async fn handle_conn(conn: quinn::Connection, uuid: [u8; 16], password: &str) {
         let notify = notify.clone();
         let sessions = sessions.clone();
         let fragments = fragments.clone();
-        let uuid = uuid;
         let password = password.to_string();
         tokio::spawn(async move {
-            uni_stream_loop(conn, &uuid, &password, &auth, &notify, &sessions, &fragments).await;
+            uni_stream_loop(
+                conn, &uuid, &password, &auth, &notify, &sessions, &fragments,
+            )
+            .await;
         });
     }
 
@@ -227,7 +235,13 @@ async fn handle_conn(conn: quinn::Connection, uuid: [u8; 16], password: &str) {
             Err(_) => return,
         };
         if !authenticated.load(Ordering::SeqCst) {
-            notify.notified().await;
+            if tokio::time::timeout(AUTH_TIMEOUT, notify.notified())
+                .await
+                .is_err()
+            {
+                conn.close(0_u32.into(), b"authentication timeout");
+                return;
+            }
             if !authenticated.load(Ordering::SeqCst) {
                 return;
             }
@@ -247,7 +261,7 @@ async fn uni_stream_loop(
     authenticated: &Arc<AtomicBool>,
     notify: &Arc<tokio::sync::Notify>,
     sessions: &Arc<Mutex<HashMap<u16, UdpSession>>>,
-    fragments: &Arc<Mutex<HashMap<(u16, u16), Vec<(u8, Vec<u8>)>>>>,
+    fragments: &FragmentMap,
 ) {
     loop {
         let mut recv = match conn.accept_uni().await {
@@ -270,7 +284,7 @@ async fn uni_stream_loop(
                 let mut peer = [0u8; 16];
                 peer.copy_from_slice(&rest[0..16]);
                 let token = &rest[16..48];
-                if peer == *uuid && compute_token(&conn, uuid, password).map_or(false, |t| &t == token) {
+                if peer == *uuid && compute_token(&conn, uuid, password).is_ok_and(|t| t == token) {
                     authenticated.store(true, Ordering::SeqCst);
                     notify.notify_one();
                     tracing::debug!("tuic auth ok");
@@ -280,7 +294,13 @@ async fn uni_stream_loop(
             }
             CMD_PACKET => {
                 if !authenticated.load(Ordering::SeqCst) {
-                    notify.notified().await;
+                    if tokio::time::timeout(AUTH_TIMEOUT, notify.notified())
+                        .await
+                        .is_err()
+                    {
+                        conn.close(0_u32.into(), b"authentication timeout");
+                        return;
+                    }
                     if !authenticated.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -312,7 +332,7 @@ async fn datagram_loop(
     authenticated: &Arc<AtomicBool>,
     notify: &Arc<tokio::sync::Notify>,
     sessions: &Arc<Mutex<HashMap<u16, UdpSession>>>,
-    fragments: &Arc<Mutex<HashMap<(u16, u16), Vec<(u8, Vec<u8>)>>>>,
+    fragments: &FragmentMap,
 ) {
     loop {
         let dg = match conn.read_datagram().await {
@@ -325,7 +345,13 @@ async fn datagram_loop(
         match dg[1] {
             CMD_PACKET => {
                 if !authenticated.load(Ordering::SeqCst) {
-                    notify.notified().await;
+                    if tokio::time::timeout(AUTH_TIMEOUT, notify.notified())
+                        .await
+                        .is_err()
+                    {
+                        conn.close(0_u32.into(), b"authentication timeout");
+                        return;
+                    }
                     if !authenticated.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -336,7 +362,10 @@ async fn datagram_loop(
             }
             CMD_DISSOCIATE => {
                 if dg.len() >= 4 {
-                    sessions.lock().await.remove(&u16::from_be_bytes([dg[2], dg[3]]));
+                    sessions
+                        .lock()
+                        .await
+                        .remove(&u16::from_be_bytes([dg[2], dg[3]]));
                 }
             }
             CMD_HEARTBEAT => {}
@@ -348,7 +377,7 @@ async fn datagram_loop(
 async fn relay_udp(
     conn: &quinn::Connection,
     sessions: &Arc<Mutex<HashMap<u16, UdpSession>>>,
-    fragments: &Arc<Mutex<HashMap<(u16, u16), Vec<(u8, Vec<u8>)>>>>,
+    fragments: &FragmentMap,
     pkt: UdpPacket,
     mode: UdpMode,
 ) {
@@ -389,24 +418,28 @@ async fn ensure_session(
     if let Some(s) = sessions.lock().await.get(&assoc_id) {
         return Ok(s.socket.clone());
     }
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?);
+    let socket = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| e.to_string())?,
+    );
     {
         let mut map = sessions.lock().await;
         if let Some(s) = map.get(&assoc_id) {
             return Ok(s.socket.clone());
         }
-        map.insert(assoc_id, UdpSession { socket: socket.clone() });
+        map.insert(
+            assoc_id,
+            UdpSession {
+                socket: socket.clone(),
+            },
+        );
     }
     spawn_udp_reader(conn.clone(), socket.clone(), assoc_id, mode);
     Ok(socket)
 }
 
-fn spawn_udp_reader(
-    conn: quinn::Connection,
-    socket: Arc<UdpSocket>,
-    assoc_id: u16,
-    mode: UdpMode,
-) {
+fn spawn_udp_reader(conn: quinn::Connection, socket: Arc<UdpSocket>, assoc_id: u16, mode: UdpMode) {
     tokio::spawn(async move {
         let mut buf = [0u8; 65535];
         loop {
@@ -428,10 +461,10 @@ fn spawn_udp_reader(
             match mode {
                 UdpMode::Datagram => {
                     let len = out.len();
-                    if let Err(_) = conn.send_datagram(Bytes::from(out)) {
-                        if conn.max_datagram_size().is_some_and(|m| len > m) {
-                            send_udp_uni(&conn, &buf[..n], assoc_id, &src).await;
-                        }
+                    if conn.send_datagram(Bytes::from(out)).is_err()
+                        && conn.max_datagram_size().is_some_and(|m| len > m)
+                    {
+                        send_udp_uni(&conn, &buf[..n], assoc_id, &src).await;
                     }
                 }
                 UdpMode::Uni => {
@@ -474,7 +507,10 @@ fn encode_socket_addr(src: &SocketAddr, out: &mut Vec<u8>) {
     }
 }
 
-async fn handle_tcp(mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<(), String> {
+async fn handle_tcp(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<(), String> {
     let mut ver = [0u8; 1];
     recv.read_exact(&mut ver).await.map_err(|e| e.to_string())?;
     let mut cmd = [0u8; 1];
@@ -485,9 +521,17 @@ async fn handle_tcp(mut send: quinn::SendStream, mut recv: quinn::RecvStream) ->
     let target = read_addr(&mut recv).await?;
     let upstream = target.connect().await.map_err(|e| e.to_string())?;
     let (mut ur, mut uw) = upstream.into_split();
-    let a = tokio::io::copy(&mut recv, &mut uw);
-    let b = tokio::io::copy(&mut ur, &mut send);
-    let _ = tokio::join!(a, b);
+    let client_to_upstream = async {
+        let result = tokio::io::copy(&mut recv, &mut uw).await;
+        let _ = uw.shutdown().await;
+        result
+    };
+    let upstream_to_client = async {
+        let result = tokio::io::copy(&mut ur, &mut send).await;
+        let _ = send.finish();
+        result
+    };
+    let _ = tokio::join!(client_to_upstream, upstream_to_client);
     Ok(())
 }
 
@@ -502,7 +546,10 @@ async fn read_addr<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<Addr, S
             r.read_exact(&mut dom).await.map_err(|e| e.to_string())?;
             let mut port = [0u8; 2];
             r.read_exact(&mut port).await.map_err(|e| e.to_string())?;
-            Ok(Addr::Domain(String::from_utf8_lossy(&dom).to_string(), u16::from_be_bytes(port)))
+            Ok(Addr::Domain(
+                String::from_utf8_lossy(&dom).to_string(),
+                u16::from_be_bytes(port),
+            ))
         }
         0x01 => {
             let mut b = [0u8; 4];
@@ -519,7 +566,10 @@ async fn read_addr<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<Addr, S
             r.read_exact(&mut b).await.map_err(|e| e.to_string())?;
             let mut port = [0u8; 2];
             r.read_exact(&mut port).await.map_err(|e| e.to_string())?;
-            Ok(Addr::Ip(IpAddr::V6(Ipv6Addr::from(b)), u16::from_be_bytes(port)))
+            Ok(Addr::Ip(
+                IpAddr::V6(Ipv6Addr::from(b)),
+                u16::from_be_bytes(port),
+            ))
         }
         other => Err(format!("unsupported tuic address type 0x{other:02x}")),
     }
@@ -529,7 +579,7 @@ async fn read_addr<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<Addr, S
 pub struct TuicClient {
     pub conn: quinn::Connection,
     next_assoc: Arc<AtomicU16>,
-    udp_rx: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
+    udp_rx: UdpSenderMap,
 }
 
 impl TuicClient {
@@ -543,9 +593,12 @@ impl TuicClient {
         password: &str,
     ) -> Result<Self, String> {
         let cfg = crate::tls::quinn_client_config(identity, insecure, &[b"h3"])?;
-        let endpoint =
-            quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+        let endpoint = quinn::Endpoint::client(
+            "0.0.0.0:0"
+                .parse::<SocketAddr>()
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         let server_addr = tokio::net::lookup_host(format!("{server}:{port}"))
             .await
             .map_err(|e| e.to_string())?
@@ -585,17 +638,14 @@ impl TuicClient {
                     if dg.len() < 2 || dg[0] != VER {
                         continue;
                     }
-                    match dg[1] {
-                        CMD_PACKET => {
-                            if let Some(pkt) = parse_packet(&dg[2..]) {
-                                if let Some(tx) = udp_rx.lock().await.get(&pkt.assoc_id) {
-                                    if let Some(addr) = resolve(&pkt.addr).await {
-                                        let _ = tx.send((addr, pkt.data));
-                                    }
+                    if dg[1] == CMD_PACKET {
+                        if let Some(pkt) = parse_packet(&dg[2..]) {
+                            if let Some(tx) = udp_rx.lock().await.get(&pkt.assoc_id) {
+                                if let Some(addr) = resolve(&pkt.addr).await {
+                                    let _ = tx.try_send((addr, pkt.data));
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
             });
@@ -620,7 +670,7 @@ impl TuicClient {
     /// receive replies via [`TuicUdp::recv`].
     pub async fn open_udp(&self) -> TuicUdp {
         let assoc_id = self.next_assoc.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+        let (tx, rx) = mpsc::channel::<UdpReply>(256);
         self.udp_rx.lock().await.insert(assoc_id, tx);
         TuicUdp {
             conn: self.conn.clone(),
@@ -634,7 +684,7 @@ impl TuicClient {
 pub struct TuicUdp {
     conn: quinn::Connection,
     assoc_id: u16,
-    rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    rx: mpsc::Receiver<UdpReply>,
 }
 
 impl TuicUdp {
@@ -652,7 +702,9 @@ impl TuicUdp {
         encode_addr(target, &mut buf);
         buf.extend_from_slice(data);
         let bytes = Bytes::from(buf);
-        self.conn.send_datagram(bytes).map_err(|e| format!("send datagram: {e}"))
+        self.conn
+            .send_datagram(bytes)
+            .map_err(|e| format!("send datagram: {e}"))
     }
 
     /// Receive the next UDP reply from the relay.

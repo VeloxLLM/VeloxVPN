@@ -9,7 +9,7 @@
 ## Features / 特性
 
 - **Only 3 protocols** — VLESS, AnyTLS, TUIC. No extra bloat. / 只支持 VLESS、AnyTLS、TUIC 三种协议，没有多余功能。
-- **Simple local Web UI** — a browser-based panel (similar to a Cloud9-style web terminal) with two modules: **Subscription URL** and **Admin**, protected by a login (default `admin` / `admin1234`, changeable). / 简洁的本地 Web 管理界面，类似 Cloud9 风格的 Web 面板，包含**订阅地址**与**管理后台**两个模块，带登录保护（默认 `admin` / `admin1234`，可修改）。
+- **Simple local Web UI** — a browser-based panel with subscription and admin modules. A random bootstrap password is generated on first start and stored next to the config in `initial-admin-password.txt` with owner-only permissions. / 简洁的本地 Web 管理界面，包含订阅与管理模块。首次启动会生成随机初始密码，并以仅文件所有者可读的权限保存到配置旁的 `initial-admin-password.txt`。
 - **Subscription in two formats** — raw `vless://`/`anytls://`/`tuic://` URIs and a ready-to-use **Clash / Mihomo** YAML (proxies + rules). / 订阅支持两种格式：原始链接和可直接导入的 **Clash / Mihomo** YAML（含节点与规则）。
 - **Rust & async** — high performance, low memory footprint, memory-safe. / 基于 Rust 异步运行时，性能高、内存占用低、内存安全。
 - **Random ports** — every inbound gets a randomly generated port **once at first startup, then fixed** (persisted in config). / 全部入站使用**随机端口**，**首次启动时生成一次，此后保持不变**（持久化到配置）。
@@ -81,10 +81,10 @@ cargo build --release
 Then open the web UI in your browser and log in: / 然后在浏览器打开 Web 界面并登录：
 
 ```
-http://127.0.0.1:8080        # default login: admin / admin1234
+http://127.0.0.1:8080
 ```
 
-- Default login is **`admin` / `admin1234`**; you can change the username & password after logging in (Admin → Account). / 默认账号 **`admin` / `admin1234`**，登录后可在「管理后台 → 账号」修改用户名和密码。
+- The username defaults to `admin`; read the one-time password from `initial-admin-password.txt`, sign in, change it, and then remove the bootstrap file. Passwords are persisted only as Argon2id hashes. / 默认用户名为 `admin`；请从 `initial-admin-password.txt` 读取一次性密码，登录后立即修改并删除该引导文件。配置中仅保存 Argon2id 密码哈希。
 - If `cloudflared` is installed, a VLESS inbound with `via: "cf-quick-tunnel"` automatically opens a quick tunnel and its public `*.trycloudflare.com` hostname is written into the subscription. / 若本机装有 `cloudflared`，`via: "cf-quick-tunnel"` 的 VLESS 入站会自动开启快速隧道，并把 `*.trycloudflare.com` 公网域名写入订阅。
 
 ## Configuration / 配置
@@ -95,9 +95,7 @@ Create a `config.json` like this: / 配置示例 `config.json`：
 {
   "web": {
     "listen": "127.0.0.1:8080",
-    "admin_token": "your-admin-token",
-    "user": "admin",
-    "password": "admin1234"
+    "user": "admin"
   },
   "subscription": {
     "enabled": true,
@@ -197,14 +195,14 @@ The admin module uses a **Cloud9-style IDE layout** (dark theme, reference: AWS 
 │  · Sub URL│  │  node card / 节点卡片                     │  │
 │           │  └──────────────────────────────────────────┘  │
 ├───────────┴────────────────────────────────────────────────┤
-│  Terminal / logs · 实时连接日志                              │  ← bottom panel / 底部面板
+│  Runtime events · 运行状态与管理事件                         │  ← bottom panel / 底部面板
 └────────────────────────────────────────────────────────────┘
 ```
 
 - **Top toolbar** — module switches: Nodes / Subscription / Status. / 顶部工具栏：节点 / 订阅 / 状态 模块切换。
 - **Left sidebar** — inbound node list (VLESS / AnyTLS / TUIC) with an "Add" button. / 左侧边栏：入站节点列表，含「添加」按钮。
 - **Center editor area** — node cards / detail editing forms, one tab per node. / 中间编辑区：节点卡片 / 详情编辑表单，每个节点一个标签页。
-- **Bottom panel** — real-time connection logs like a terminal. / 底部面板：类似终端的实时连接日志。
+- **Bottom panel** — bounded, redacted runtime events plus current node status, with text filtering. / 底部面板：有界、脱敏的运行事件及节点当前状态，并支持文本过滤。
 - **Admin actions** — regenerate subscription URL, set SNI / ALPN, add / edit / delete nodes, view status. Ports are fixed after first startup and are **not** regenerated. / 管理操作：重新生成订阅地址、设置 SNI / ALPN、增删改节点、查看状态。端口在首次启动后固定，**不会重新生成**。
 
 ## Project Structure / 项目结构
@@ -237,6 +235,14 @@ cargo run -- --config config.json
 ```
 
 Requirements: Rust stable (1.75+) / 环境要求：Rust stable（1.75+）
+
+## Operations / 运维
+
+Deployment hardening, health checks, backup/restore, upgrade and rollback are documented in [`docs/OPERATIONS.md`](docs/OPERATIONS.md). / 部署加固、健康检查、备份恢复、升级和回滚说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
+
+```bash
+veloxvpn health --url http://127.0.0.1:18080/api/status
+```
 
 ## License / 许可证
 

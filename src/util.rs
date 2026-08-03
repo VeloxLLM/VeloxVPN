@@ -23,6 +23,45 @@ pub fn random_token(len: usize) -> String {
         .collect()
 }
 
+/// Hash a password with Argon2id and a fresh random salt.
+pub fn hash_password(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::Argon2;
+
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| format!("password hash failed: {e}"))
+}
+
+/// Verify an Argon2id password hash without exposing the stored digest.
+pub fn verify_password(hash: &str, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+
+    PasswordHash::new(hash).ok().is_some_and(|parsed| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    })
+}
+
+/// Constant-time equality for authentication tokens of equal length.
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    constant_time_eq_bytes(left.as_bytes(), right.as_bytes())
+}
+
+pub fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -38,7 +77,11 @@ pub fn sha256_raw(data: &[u8]) -> [u8; 32] {
 
 /// Generate a self-signed certificate with the given SANs.
 /// Writes PEM files so all TLS inbound share one identity.
-pub fn generate_self_signed(cert_path: &Path, key_path: &Path, sans: &[String]) -> Result<(), String> {
+pub fn generate_self_signed(
+    cert_path: &Path,
+    key_path: &Path,
+    sans: &[String],
+) -> Result<(), String> {
     use rcgen::generate_simple_self_signed;
     let mut all = vec![
         "localhost".to_string(),
@@ -55,6 +98,19 @@ pub fn generate_self_signed(cert_path: &Path, key_path: &Path, sans: &[String]) 
     let key_pem = certified_key.key_pair.serialize_pem();
     std::fs::write(cert_path, cert_pem).map_err(|e| e.to_string())?;
     std::fs::write(key_path, key_pem).map_err(|e| e.to_string())?;
+    restrict_file_permissions(cert_path)?;
+    restrict_file_permissions(key_path)?;
+    Ok(())
+}
+
+/// Restrict a secret-bearing file to its owner on Unix.
+pub fn restrict_file_permissions(_path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -65,7 +121,11 @@ pub fn b64url(input: &[u8]) -> String {
 
 /// Public address used for subscription URIs: `server` field if set, else listen ip.
 pub fn public_host(inb: &InboundConfig, default_port: u16) -> (String, u16) {
-    let port = inb.effective_port();
+    let port = if inb.via.as_deref() == Some("cf-quick-tunnel") {
+        default_port
+    } else {
+        inb.effective_port()
+    };
     if let Some(server) = &inb.server {
         let (host, port) = split_host_port(server, port);
         return (host, port);
@@ -100,7 +160,10 @@ pub fn build_uri(inb: &InboundConfig) -> Option<String> {
             let ws_host = if via_cf {
                 host.clone()
             } else {
-                inb.host.as_deref().unwrap_or("www.cloudflare.com").to_string()
+                inb.host
+                    .as_deref()
+                    .unwrap_or("www.cloudflare.com")
+                    .to_string()
             };
             let path = inb.path.as_deref().unwrap_or("/");
             if network == "ws" {
@@ -178,13 +241,18 @@ pub fn build_clash_subscription(inbounds: &[InboundConfig]) -> String {
     for inb in inbounds {
         match inb.typ {
             Protocol::Vless => {
-                let Some(uuid) = inb.uuid.as_ref() else { continue };
+                let Some(uuid) = inb.uuid.as_ref() else {
+                    continue;
+                };
                 let (host, port) = public_host(inb, 443);
                 let via_cf = inb.via.as_deref() == Some("cf-quick-tunnel");
                 let ws_host = if via_cf {
                     host.clone()
                 } else {
-                    inb.host.as_deref().unwrap_or("www.cloudflare.com").to_string()
+                    inb.host
+                        .as_deref()
+                        .unwrap_or("www.cloudflare.com")
+                        .to_string()
                 };
                 let path = inb.path.as_deref().unwrap_or("/");
                 out.push_str(&format!(
@@ -200,12 +268,15 @@ pub fn build_clash_subscription(inbounds: &[InboundConfig]) -> String {
                 ));
             }
             Protocol::AnyTls => {
-                let Some(password) = inb.password.as_ref() else { continue };
+                let Some(password) = inb.password.as_ref() else {
+                    continue;
+                };
                 let (host, port) = public_host(inb, 443);
                 let sni = inb.sni.as_deref().unwrap_or("www.cloudflare.com");
                 let default_alpn: Vec<String> = vec!["h2".into(), "http/1.1".into()];
                 let alpn = inb.alpn.as_deref().unwrap_or(&default_alpn);
-                let alpn_str: Vec<String> = alpn.iter().map(|a| format!("  - \"{}\"", a)).collect();
+                let alpn_str: Vec<String> =
+                    alpn.iter().map(|a| format!("      - \"{}\"", a)).collect();
                 out.push_str(&format!(
                     "  - name: {}\n    type: anytls\n    server: {}\n    port: {}\n    password: {}\n    tls: true\n    udp: true\n    servername: {}\n    alpn:\n{}\n    skip-cert-verify: true\n",
                     yaml_escape(&inb.name),
@@ -217,7 +288,9 @@ pub fn build_clash_subscription(inbounds: &[InboundConfig]) -> String {
                 ));
             }
             Protocol::Tuic => {
-                let Some(uuid) = inb.uuid.as_ref() else { continue };
+                let Some(uuid) = inb.uuid.as_ref() else {
+                    continue;
+                };
                 let password = inb.password.as_deref().unwrap_or("");
                 let (host, port) = public_host(inb, 443);
                 let sni = inb.sni.as_deref().unwrap_or("www.cloudflare.com");
@@ -234,15 +307,43 @@ pub fn build_clash_subscription(inbounds: &[InboundConfig]) -> String {
         }
     }
 
-    let names: Vec<String> = inbounds.iter().map(|i| format!("      - {}", yaml_escape(&i.name))).collect();
+    let names: Vec<String> = inbounds
+        .iter()
+        .map(|i| format!("      - {}", yaml_escape(&i.name)))
+        .collect();
     out.push_str(&format!(
         "proxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n{}\n      - DIRECT\n",
         names.join("\n"),
     ));
-    out.push_str(
-        "rules:\n  - GEOIP,CN,DIRECT\n  - MATCH,PROXY\n",
-    );
+    out.push_str("rules:\n  - GEOIP,CN,DIRECT\n  - MATCH,PROXY\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_vless_subscription_uses_edge_port() {
+        let mut config = crate::config::Config::default();
+        config.assign_missing_ports().unwrap();
+        let mut inbound = config.inbounds.remove(0);
+        inbound.server = Some("example.trycloudflare.com".into());
+        let uri = build_uri(&inbound).unwrap();
+        assert!(uri.contains("@example.trycloudflare.com:443"));
+        assert!(!uri.contains(&format!(":{}?", inbound.effective_port())));
+    }
+
+    #[test]
+    fn clash_anytls_alpn_is_nested_under_the_proxy() {
+        let mut config = crate::config::Config::default();
+        config.assign_missing_ports().unwrap();
+
+        let subscription = build_clash_subscription(&config.inbounds);
+
+        assert!(subscription.contains("    alpn:\n      - \"h2\"\n      - \"http/1.1\"\n"));
+        assert!(!subscription.contains("    alpn:\n  - \"h2\""));
+    }
 }
 
 /// Build connection parameters for an outbound, used by protocol clients.

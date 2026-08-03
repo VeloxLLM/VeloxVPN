@@ -107,7 +107,9 @@ impl Addr {
                 })?
             }
         };
-        tokio::net::TcpStream::connect(addr).await
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
     }
 }
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=VeloxVPN isolated acceptance-test service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veloxvpn
+Group=veloxvpn
+WorkingDirectory=/opt/veloxvpn-test
+Environment=PATH=/opt/veloxvpn-test/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=RUST_LOG=info,veloxvpn=debug
+ExecStart=/opt/veloxvpn-test/veloxvpn --config /opt/veloxvpn-test/config.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/veloxvpn-test
+MemoryMax=300M
+LimitNOFILE=65536
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

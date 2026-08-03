@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 #[derive(Debug, Clone)]
 pub struct TlsIdentity {
@@ -13,32 +13,29 @@ pub struct TlsIdentity {
 
 /// Load cert.pem / key.pem next to the config file.
 pub fn load_identity(config_path: &Path) -> Result<TlsIdentity, String> {
-    let cert_pem = std::fs::read(config_path.with_file_name("cert.pem")).map_err(|e| e.to_string())?;
-    let key_pem = std::fs::read(config_path.with_file_name("key.pem")).map_err(|e| e.to_string())?;
+    let cert_pem =
+        std::fs::read(config_path.with_file_name("cert.pem")).map_err(|e| e.to_string())?;
+    let key_pem =
+        std::fs::read(config_path.with_file_name("key.pem")).map_err(|e| e.to_string())?;
 
     let certs = rustls_pemfile_certs(&cert_pem)?;
     let key = rustls_pemfile_private_key(&key_pem)?;
-    Ok(TlsIdentity { cert_der: certs, key_der: key })
+    Ok(TlsIdentity {
+        cert_der: certs,
+        key_der: key,
+    })
 }
 
 fn rustls_pemfile_certs(pem: &[u8]) -> Result<Vec<u8>, String> {
-    let mut reader = std::io::BufReader::new(pem);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    certs
-        .into_iter()
-        .next()
-        .map(|c| c.to_vec())
-        .ok_or_else(|| "no certificate found".to_string())
+    CertificateDer::from_pem_slice(pem)
+        .map(|cert| cert.to_vec())
+        .map_err(|e| format!("certificate PEM: {e}"))
 }
 
 fn rustls_pemfile_private_key(pem: &[u8]) -> Result<Vec<u8>, String> {
-    let mut reader = std::io::BufReader::new(pem);
-    match rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| e.to_string())?
-    {
-        Some(k) => Ok(k.secret_der().to_vec()),
-        None => Err("no private key found".to_string()),
-    }
+    PrivateKeyDer::from_pem_slice(pem)
+        .map(|key| key.secret_der().to_vec())
+        .map_err(|e| format!("private key PEM: {e}"))
 }
 
 /// tokio-rustls server config (rustls 0.23).
@@ -92,14 +89,29 @@ pub fn rustls_client_config(
 /// QUIC transport tuning: BBR congestion control + datagram buffers (for TUIC UDP relay).
 pub fn quinn_transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
-    tc.datagram_receive_buffer_size(Some(256 * 1024));
-    tc.datagram_send_buffer_size(64 * 1024);
+    // A compatibility client commonly multiplexes many short TCP requests over
+    // one QUIC connection. Quinn's default of 100 streams was observable as
+    // `too many open streams` at our 100-request acceptance gate.
+    tc.max_concurrent_bidi_streams(256_u32.into());
+    tc.max_concurrent_uni_streams(256_u32.into());
+    // Keep aggregate memory bounded for the 1 GiB target while giving a single
+    // bulk stream enough credit for typical public-network bandwidth-delay
+    // products.
+    tc.stream_receive_window((2_u32 * 1024 * 1024).into());
+    tc.receive_window((32_u32 * 1024 * 1024).into());
+    tc.send_window(32_u64 * 1024 * 1024);
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    tc.datagram_receive_buffer_size(Some(1024 * 1024));
+    tc.datagram_send_buffer_size(512 * 1024);
     tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Arc::new(tc)
 }
 
 /// quinn server config (rustls 0.23 inside) with the given ALPN.
-pub fn quinn_server_config(id: &TlsIdentity, alpn: &[&[u8]]) -> Result<quinn::ServerConfig, String> {
+pub fn quinn_server_config(
+    id: &TlsIdentity,
+    alpn: &[&[u8]],
+) -> Result<quinn::ServerConfig, String> {
     ensure_provider();
     let cert = rustls::pki_types::CertificateDer::from(id.cert_der.clone());
     let key = rustls::pki_types::PrivateKeyDer::try_from(id.key_der.clone())
@@ -109,8 +121,7 @@ pub fn quinn_server_config(id: &TlsIdentity, alpn: &[&[u8]]) -> Result<quinn::Se
         .with_single_cert(vec![cert], key)
         .map_err(|e| e.to_string())?;
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)
-        .map_err(|e| e.to_string())?;
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(cfg).map_err(|e| e.to_string())?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
     server.transport_config(quinn_transport_config());
     Ok(server)
@@ -144,8 +155,7 @@ pub fn quinn_client_config(
     };
     let mut cfg = cfg;
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
-        .map_err(|e| e.to_string())?;
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(cfg).map_err(|e| e.to_string())?;
     let mut client = quinn::ClientConfig::new(Arc::new(quic));
     client.transport_config(quinn_transport_config());
     Ok(client)

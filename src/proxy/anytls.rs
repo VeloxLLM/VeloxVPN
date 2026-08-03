@@ -4,7 +4,7 @@
 //! - Auth: `[sha256(password):32][padding0_len:2 BE][padding0]`
 //! - Session frame: `[cmd:1][stream_id:4 BE][data_len:2 BE][data]`
 //!   commands: 0=waste, 1=SYN, 2=PSH, 3=FIN, 4=settings, 5=alert,
-//!             6=update padding, 7=SYNACK, 8=heart req, 9=heart resp, 10=server settings
+//!   6=update padding, 7=SYNACK, 8=heart req, 9=heart resp, 10=server settings
 //! - Target address is the first cmdPSH data on a stream, as SocksAddr `[ATYP][addr][port:2 BE]`.
 
 use std::net::SocketAddr;
@@ -38,6 +38,8 @@ const DEFAULT_PADDING_SCHEME: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,50
 
 type TlsTcp = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsTcp>>>;
+const STREAM_QUEUE_CAPACITY: usize = 64;
+const RELAY_BUFFER_SIZE: usize = 32 * 1024;
 
 fn frame(cmd: u8, sid: u32, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(7 + data.len());
@@ -55,7 +57,9 @@ async fn send_frame<S: tokio::io::AsyncWrite + Unpin>(
     data: &[u8],
 ) -> Result<(), String> {
     let mut w = w.lock().await;
-    w.write_all(&frame(cmd, sid, data)).await.map_err(|e| e.to_string())
+    w.write_all(&frame(cmd, sid, data))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn read_exact_len<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Result<Vec<u8>, String> {
@@ -82,6 +86,9 @@ pub async fn serve(
                     continue;
                 }
             };
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!("anytls TCP_NODELAY failed: {e}");
+            }
             let acceptor = acceptor.clone();
             let password = password.clone();
             tokio::spawn(async move {
@@ -109,7 +116,7 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
     // Auth
     let mut sha = [0u8; 32];
     r.read_exact(&mut sha).await.map_err(|e| e.to_string())?;
-    if sha != crate::util::sha256_raw(password.as_bytes()) {
+    if !crate::util::constant_time_eq_bytes(&sha, &crate::util::sha256_raw(password.as_bytes())) {
         return Err("anytls auth failed".into());
     }
     let mut plen = [0u8; 2];
@@ -121,7 +128,7 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
     }
 
     let peer_version = Arc::new(AtomicU8::new(0));
-    let mut streams: std::collections::HashMap<u32, mpsc::UnboundedSender<Vec<u8>>> =
+    let mut streams: std::collections::HashMap<u32, mpsc::Sender<Vec<u8>>> =
         std::collections::HashMap::new();
     let mut got_settings = false;
 
@@ -133,13 +140,19 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
         let cmd = hdr[0];
         let sid = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
         let len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
-        let data = if len > 0 { read_exact_len(&mut r, len).await? } else { Vec::new() };
+        let data = if len > 0 {
+            read_exact_len(&mut r, len).await?
+        } else {
+            Vec::new()
+        };
 
         match cmd {
             CMD_PSH => {
                 if let Some(tx) = streams.get(&sid) {
-                    if !data.is_empty() {
-                        let _ = tx.send(data);
+                    if !data.is_empty() && tx.try_send(data).is_err() {
+                        tracing::warn!("anytls stream {sid} input queue full; closing stream");
+                        streams.remove(&sid);
+                        let _ = send_frame(&w, CMD_FIN, sid, &[]).await;
                     }
                 }
             }
@@ -151,7 +164,7 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
                 if streams.contains_key(&sid) {
                     continue;
                 }
-                let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_CAPACITY);
                 let w = w.clone();
                 let pv = peer_version.clone();
                 tokio::spawn(async move {
@@ -175,7 +188,8 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
                     }
                 }
                 // Padding scheme negotiation: we always send ours.
-                let _ = send_frame(&w, CMD_UPDATE_PADDING, 0, DEFAULT_PADDING_SCHEME.as_bytes()).await;
+                let _ =
+                    send_frame(&w, CMD_UPDATE_PADDING, 0, DEFAULT_PADDING_SCHEME.as_bytes()).await;
                 if v >= 2 {
                     peer_version.store(2, Ordering::Relaxed);
                     let _ = send_frame(&w, CMD_SERVER_SETTINGS, 0, b"v=2\n").await;
@@ -194,7 +208,7 @@ async fn handle_conn(tls: TlsTcp, password: &str) -> Result<(), String> {
 /// Server stream handler: read SocksAddr, dial, then relay.
 async fn stream_handler(
     sid: u32,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     w: SharedWriter,
     peer_version: Arc<AtomicU8>,
 ) {
@@ -222,7 +236,7 @@ async fn stream_handler(
     let w2 = w.clone();
     // upstream -> client (PSH frames)
     let up_task = tokio::spawn(async move {
-        let mut buf = [0u8; 16384];
+        let mut buf = [0u8; RELAY_BUFFER_SIZE];
         loop {
             match ur.read(&mut buf).await {
                 Ok(0) => break,
@@ -239,7 +253,8 @@ async fn stream_handler(
     // client -> upstream
     let a = tokio::io::copy(&mut reader, &mut uw);
     let _ = a.await;
-    up_task.abort();
+    let _ = uw.shutdown().await;
+    let _ = up_task.await;
 }
 
 async fn read_socksaddr<R: AsyncRead + Unpin>(r: &mut R) -> Result<Addr, String> {
@@ -281,12 +296,16 @@ async fn read_socksaddr<R: AsyncRead + Unpin>(r: &mut R) -> Result<Addr, String>
 pub struct ChunkedReader {
     buf: Vec<u8>,
     pos: usize,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl ChunkedReader {
-    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
-        ChunkedReader { buf: Vec::new(), pos: 0, rx }
+    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        ChunkedReader {
+            buf: Vec::new(),
+            pos: 0,
+            rx,
+        }
     }
 }
 
@@ -330,23 +349,40 @@ pub async fn dial(
     alpn: &[String],
     password: &str,
     target: &Addr,
-) -> Result<(tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>), String>
-{
+) -> Result<
+    (
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ),
+    String,
+> {
     let tcp = tokio::net::TcpStream::connect(format!("{server}:{port}"))
         .await
         .map_err(|e| e.to_string())?;
+    tcp.set_nodelay(true).map_err(|e| e.to_string())?;
     let cfg = crate::tls::rustls_client_config(identity, insecure, alpn)?;
     let connector = TlsConnector::from(cfg);
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .map_err(|e| format!("sni: {e}"))?;
-    let tls = connector.connect(server_name, tcp).await.map_err(|e| e.to_string())?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| e.to_string())?;
     let (mut r, w) = tokio::io::split(tls);
     let w = Arc::new(Mutex::new(w));
 
     // Auth: sha256(password) + padding0 len(0)
     let sha = crate::util::sha256_raw(password.as_bytes());
-    w.lock().await.write_all(&sha).await.map_err(|e| e.to_string())?;
-    w.lock().await.write_all(&[0x00, 0x00]).await.map_err(|e| e.to_string())?;
+    w.lock()
+        .await
+        .write_all(&sha)
+        .await
+        .map_err(|e| e.to_string())?;
+    w.lock()
+        .await
+        .write_all(&[0x00, 0x00])
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Settings
     let settings = format!(
@@ -371,7 +407,7 @@ pub async fn dial(
     // send task: d1r -> PSH frames
     let w_send = w.clone();
     tokio::spawn(async move {
-        let mut buf = [0u8; 16384];
+        let mut buf = [0u8; RELAY_BUFFER_SIZE];
         loop {
             match d1r.read(&mut buf).await {
                 Ok(0) => break,

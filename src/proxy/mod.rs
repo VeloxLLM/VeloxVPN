@@ -16,12 +16,8 @@ use crate::tls::TlsIdentity;
 pub use address::Addr;
 
 /// Bidirectional copy between two stream pairs.
-pub async fn bidirectional<R1, W1, R2, W2>(
-    r1: &mut R1,
-    w1: &mut W1,
-    r2: &mut R2,
-    w2: &mut W2,
-) where
+pub async fn bidirectional<R1, W1, R2, W2>(r1: &mut R1, w1: &mut W1, r2: &mut R2, w2: &mut W2)
+where
     R1: AsyncRead + Unpin,
     W1: AsyncWrite + Unpin,
     R2: AsyncRead + Unpin,
@@ -46,28 +42,33 @@ pub async fn start_inbound(
     let listen = format!("{}:{}", inb.listen, port);
     match inb.typ {
         Protocol::Vless => {
-            let uuid = parse_uuid(inb.uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"))?;
+            let uuid = parse_uuid(
+                inb.uuid
+                    .as_deref()
+                    .unwrap_or("00000000-0000-0000-0000-000000000000"),
+            )?;
             if inb.network.as_deref() == Some("ws") {
-                vless::serve_ws(&listen, uuid).await
+                vless::serve_ws(&listen, uuid, inb.path.as_deref().unwrap_or("/")).await
             } else {
                 vless::serve_tcp(&listen, uuid).await
             }
         }
         Protocol::AnyTls => {
-            let password = inb
-                .password
+            let password = inb.password.clone().unwrap_or_default();
+            let alpn = inb
+                .alpn
                 .clone()
-                .unwrap_or_else(|| "".to_string());
-            let alpn = inb.alpn.clone().unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
+                .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
             let cfg = crate::tls::rustls_server_config(identity, &alpn)?;
             anytls::serve(&listen, password, cfg).await
         }
         Protocol::Tuic => {
-            let uuid = parse_uuid(inb.uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"))?;
-            let password = inb
-                .password
-                .clone()
-                .unwrap_or_else(|| "".to_string());
+            let uuid = parse_uuid(
+                inb.uuid
+                    .as_deref()
+                    .unwrap_or("00000000-0000-0000-0000-000000000000"),
+            )?;
+            let password = inb.password.clone().unwrap_or_default();
             let cfg = crate::tls::quinn_server_config(identity, &[b"h3"])?;
             tuic::serve(&listen, uuid, password, cfg).await
         }

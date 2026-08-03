@@ -13,7 +13,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::proxy::{bidirectional, Addr};
+use crate::proxy::Addr;
+
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RELAY_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Encode a VLESS client header for `target`.
 pub fn vless_encode_header(uuid: &[u8; 16], target: &Addr, out: &mut Vec<u8>) {
@@ -70,14 +74,20 @@ async fn read_vless_header<R: tokio::io::AsyncRead + Unpin>(
         0x01 => {
             let mut b = [0u8; 4];
             r.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-            Ok(Addr::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])), port))
+            Ok(Addr::Ip(
+                IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])),
+                port,
+            ))
         }
         0x02 => {
             let mut len = [0u8; 1];
             r.read_exact(&mut len).await.map_err(|e| e.to_string())?;
             let mut dom = vec![0u8; len[0] as usize];
             r.read_exact(&mut dom).await.map_err(|e| e.to_string())?;
-            Ok(Addr::Domain(String::from_utf8_lossy(&dom).to_string(), port))
+            Ok(Addr::Domain(
+                String::from_utf8_lossy(&dom).to_string(),
+                port,
+            ))
         }
         0x03 => {
             let mut b = [0u8; 16];
@@ -94,26 +104,53 @@ async fn handle_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     uuid: [u8; 16],
 ) {
     let (mut r, mut w) = tokio::io::split(stream);
-    let target = match read_vless_header(&mut r, &uuid).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::debug!("vless header rejected: {e}");
-            return;
-        }
-    };
-    // VLESS server response header: [version=0][addons_len=0]
-    if w.write_all(&[0x00, 0x00]).await.is_err() {
-        return;
-    }
-    let upstream = match target.connect().await {
-        Ok(s) => s,
-        Err(e) => {
+    let target =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_vless_header(&mut r, &uuid)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                tracing::debug!("vless header rejected: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("vless header timed out");
+                return;
+            }
+        };
+    let upstream = match tokio::time::timeout(CONNECT_TIMEOUT, target.connect()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             tracing::debug!("vless dial {target} failed: {e}");
             return;
         }
+        Err(_) => {
+            tracing::debug!("vless dial {target} timed out");
+            return;
+        }
     };
+    // Only confirm the VLESS request after the upstream is connected. Sending
+    // this before dialing makes the client believe a failed/hung target is live.
+    if w.write_all(&[0x00, 0x00]).await.is_err() {
+        return;
+    }
     let (mut ur, mut uw) = upstream.into_split();
-    bidirectional(&mut r, &mut w, &mut ur, &mut uw).await;
+    let client_to_upstream = async {
+        let result = tokio::io::copy(&mut r, &mut uw).await;
+        let _ = uw.shutdown().await;
+        result
+    };
+    let upstream_to_client = async {
+        let result = tokio::io::copy(&mut ur, &mut w).await;
+        let _ = w.shutdown().await;
+        result
+    };
+    if tokio::time::timeout(RELAY_IDLE_LIMIT, async {
+        tokio::join!(client_to_upstream, upstream_to_client)
+    })
+    .await
+    .is_err()
+    {
+        tracing::debug!("vless relay {target} exceeded idle limit");
+    }
 }
 
 /// Start a raw-TCP VLESS inbound. Returns (bound addr, task handle).
@@ -143,21 +180,20 @@ pub async fn serve_tcp(
 pub async fn serve_ws(
     listen: &str,
     uuid: [u8; 16],
+    path: &str,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
-    let app = Router::new()
-        .fallback(get(ws_upgrade))
-        .with_state(uuid);
+    let app = Router::new().route(path, get(ws_upgrade)).with_state(uuid);
     let listener = TcpListener::bind(listen).await.map_err(|e| e.to_string())?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| e.to_string())
-    });
+    let handle =
+        tokio::spawn(async move { axum::serve(listener, app).await.map_err(|e| e.to_string()) });
     Ok((addr, handle))
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, axum::extract::State(uuid): axum::extract::State<[u8; 16]>) -> impl IntoResponse {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    axum::extract::State(uuid): axum::extract::State<[u8; 16]>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         let duplex = axum_ws_to_duplex(socket).await;
         handle_stream(duplex, uuid).await;
@@ -191,7 +227,7 @@ async fn axum_ws_to_duplex(ws: WebSocket) -> tokio::io::DuplexStream {
     });
 
     tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 32 * 1024];
         loop {
             match dr.read(&mut buf).await {
                 Ok(0) => break,
@@ -215,16 +251,26 @@ pub async fn dial_tcp(
     port: u16,
     uuid: &[u8; 16],
     target: &Addr,
-) -> Result<(tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf), String> {
+) -> Result<
+    (
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
+    ),
+    String,
+> {
     let mut stream = tokio::net::TcpStream::connect(format!("{server}:{port}"))
         .await
         .map_err(|e| e.to_string())?;
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
     let mut head = Vec::new();
     vless_encode_header(uuid, target, &mut head);
     stream.write_all(&head).await.map_err(|e| e.to_string())?;
     // consume server response header
     let mut resp = [0u8; 2];
-    stream.read_exact(&mut resp).await.map_err(|e| e.to_string())?;
+    stream
+        .read_exact(&mut resp)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(stream.into_split())
 }
 
@@ -233,9 +279,16 @@ pub async fn dial_ws(
     url: &str,
     uuid: &[u8; 16],
     target: &Addr,
-) -> Result<(tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>), String>
-{
-    let (ws, _resp) = tokio_tungstenite::connect_async(url).await.map_err(|e| e.to_string())?;
+) -> Result<
+    (
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ),
+    String,
+> {
+    let (ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|e| e.to_string())?;
     let (mut sink, mut stream) = ws.split();
     let (d1, d2) = tokio::io::duplex(256 * 1024);
     let (mut dr, mut dw) = tokio::io::split(d1);
@@ -261,13 +314,15 @@ pub async fn dial_ws(
     });
 
     tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 32 * 1024];
         loop {
             match dr.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if sink
-                        .send(tokio_tungstenite::tungstenite::Message::Binary(buf[..n].to_vec()))
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            buf[..n].to_vec(),
+                        ))
                         .await
                         .is_err()
                     {
@@ -286,6 +341,9 @@ pub async fn dial_ws(
     caller_w.write_all(&head).await.map_err(|e| e.to_string())?;
     // consume server response header
     let mut resp = [0u8; 2];
-    caller_r.read_exact(&mut resp).await.map_err(|e| e.to_string())?;
+    caller_r
+        .read_exact(&mut resp)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok((caller_r, caller_w))
 }

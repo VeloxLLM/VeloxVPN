@@ -61,7 +61,10 @@
   /* Bottom terminal */
   footer { background: var(--term); border-top: 1px solid var(--border); height: 140px; display: flex; flex-direction: column; }
   footer .bar { display: flex; justify-content: space-between; padding: 4px 10px; color: var(--muted); border-bottom: 1px solid var(--border); font-size: 12px; }
+  footer .bar input { width: 220px; background: var(--bg3); border: 1px solid var(--border); color: var(--fg); border-radius: 3px; padding: 2px 6px; }
   footer pre { flex: 1; overflow: auto; padding: 8px 10px; font-family: monospace; font-size: 12px; color: var(--green); }
+  .masked { filter: blur(5px); user-select: none; }
+  .failed { color: var(--red); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -80,7 +83,8 @@
     <div class="card">
       <h3>Subscription URL / 订阅地址</h3>
       <div class="url-box">
-        <input id="subUrl" readonly>
+        <input id="subUrl" type="password" readonly>
+        <button class="ghost" onclick="toggleSecret('subUrl', this)">Reveal</button>
         <button class="ghost" onclick="copyUrl()">Copy</button>
         <button onclick="regenerate()">Regenerate</button>
       </div>
@@ -90,7 +94,8 @@
         <button id="fmtClash" class="ghost" onclick="setFormat('clash')">Clash / Mihomo</button>
       </div>
     </div>
-    <pre class="sub" id="subText">loading...</pre>
+    <div style="margin-bottom:6px"><button class="ghost" onclick="toggleSubscription(this)">Reveal subscription</button></div>
+    <pre class="sub masked" id="subText">loading...</pre>
   </div>
   <div id="adminTab" class="hidden">
     <aside>
@@ -103,8 +108,8 @@
         <label>Name</label><input id="fName">
         <label>Type</label><select id="fType"><option>vless</option><option>anytls</option><option>tuic</option></select>        <label>Listen</label><input id="fListen" value="0.0.0.0">
         <label>Port (0 = random)</label><input id="fPort" type="number" value="0">
-        <label>UUID (vless)</label><input id="fUuid">
-        <label>Password</label><input id="fPassword">
+        <label>UUID (vless)</label><input id="fUuid" type="password" autocomplete="off">
+        <label>Password</label><input id="fPassword" type="password" autocomplete="off">
         <label>Network (vless)</label><input id="fNetwork" value="ws" placeholder="tcp / ws">
         <label>Host / SNI</label><input id="fHost" value="www.cloudflare.com">
         <label>WS path</label><input id="fPath" placeholder="/ws">
@@ -131,14 +136,14 @@
   </div>
 </main>
 <footer>
-  <div class="bar"><span id="statusText">connecting...</span><span>VeloxVPN</span></div>
+  <div class="bar"><span id="statusText">connecting...</span><input id="statusFilter" placeholder="Filter status / events" oninput="renderStatusRows()"><span>VeloxVPN</span></div>
   <pre id="term"></pre>
 </footer>
 <div id="loginScreen">
   <div class="login-box">
     <h2>VeloxVPN</h2>
     <input id="loginUser" placeholder="Username" value="admin" autocomplete="username">
-    <input id="loginPass" type="password" placeholder="Password" value="admin1234" autocomplete="current-password">
+    <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password">
     <button id="loginBtn" onclick="doLogin()">Login</button>
     <div id="loginErr"></div>
   </div>
@@ -146,6 +151,7 @@
 <script>
 let nodes = [];
 let current = null;
+let statusRows = [];
 const TOKEN_KEY = "veloxvpn_admin_token";
 const USER_KEY = "veloxvpn_username";
 
@@ -185,11 +191,34 @@ function logout() {
   location.reload();
 }
 
+function toggleSecret(id, button) {
+  const input = document.getElementById(id);
+  const reveal = input.type === "password";
+  input.type = reveal ? "text" : "password";
+  button.textContent = reveal ? "Hide" : "Reveal";
+}
+
+function toggleSubscription(button) {
+  const text = document.getElementById("subText");
+  const reveal = text.classList.contains("masked");
+  text.classList.toggle("masked", !reveal);
+  button.textContent = reveal ? "Hide subscription" : "Reveal subscription";
+}
+
+function renderStatusRows() {
+  const filter = (document.getElementById("statusFilter").value || "").toLowerCase();
+  const visible = statusRows.filter(row => row.toLowerCase().includes(filter));
+  document.getElementById("term").textContent = visible.join("\n") || "no matching status";
+}
+
 async function api(path, opts = {}) {
   const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   if (token()) headers["X-Admin-Token"] = token();
   const r = await fetch(path, Object.assign({}, opts, { headers }));
-  if (r.status === 401) throw new Error("unauthorized: session expired");
+  if (r.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    throw new Error("unauthorized: session expired; please sign in again");
+  }
   if (!r.ok) throw new Error(path + " -> " + r.status);
   return r.json();
 }
@@ -204,14 +233,23 @@ function showTab(t) {
 
 async function loadStatus() {
   try {
-    const s = await api("/api/status");
+    const s = await api("/api/admin/status");
     const sub = s.subscription;
     const base = sub.url.base;
     const fmtParam = subFmt === "clash" ? "&format=clash" : "";
     document.getElementById("subUrl").value = base + sub.path + "?token=" + sub.token + fmtParam;
-    const rows = s.nodes.map(n => n.name + "  [" + n.type + "]  " + (n.addr || (n.port)) + "  via:" + (n.via || "-")).join("\n");
-    document.getElementById("statusText").textContent = "nodes: " + s.nodes.length + " | " + rows.split("\n")[0] || "running";
-    document.getElementById("term").textContent = rows || "no inbounds";
+    statusRows = s.nodes.map(n => {
+      const runtime = n.runtime || {};
+      const state = runtime.state || "configured";
+      const detail = runtime.error ? " error:" + runtime.error : "";
+      return n.name + "  [" + n.type + "]  port:" + n.port + "  state:" + state + detail;
+    });
+    statusRows = statusRows.concat((s.events || []).map(event => "event: " + event));
+    const failed = s.nodes.filter(n => (n.runtime || {}).state === "failed").length;
+    const status = document.getElementById("statusText");
+    status.textContent = failed ? "STARTUP FAILURE: " + failed + " node(s)" : "nodes: " + s.nodes.length + " | running";
+    status.classList.toggle("failed", failed > 0);
+    renderStatusRows();
     return s;
   } catch (e) {
     document.getElementById("statusText").textContent = "error: " + e.message;
@@ -366,7 +404,8 @@ async function updateAccount() {
     }
     document.getElementById("aOldPass").value = "";
     document.getElementById("aPass").value = "";
-    alert("account updated");
+    alert("account updated; please sign in again");
+    logout();
   } catch (e) { alert(e.message); }
 }
 
